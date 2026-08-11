@@ -1,0 +1,89 @@
+# Fork-only manual CI wrapper. Not upstream's file and never sent upstream:
+# it exists solely so a feature branch on this fork can be verified without
+# opening a pull request. It carries ci.yml's always-on job steps behind a
+# workflow_dispatch checkout of the ref passed in.
+#
+# Upstream ci.yml's `e2e` job is deliberately excluded: it is opt-in upstream
+# (gated on repo variable ENABLE_E2E_CI) and needs a browser download plus a
+# live stack — not what branch evidence needs. The three always-on jobs
+# (agents, backend, frontend) are carried verbatim apart from the checkout ref.
+name: osc-manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: The branch, tag or SHA to verify
+        required: true
+
+jobs:
+  # ========================
+  # Agent layer — adapter drift guard (from upstream ci.yml).
+  # ========================
+  agents:
+    name: Agent adapter consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ inputs.target_ref }}"
+      - name: Show checked-out ref
+        run: |
+          echo "requested ref: ${{ inputs.target_ref }}"
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check adapters (personas → real classes, pointers resolve, no pasted bodies)
+        run: python3 scripts/check_adapters.py
+      - name: Self-test the guard (negative fixtures — proves it fails on drift)
+        run: python3 scripts/check_adapters_selftest.py
+
+  # ========================
+  # Backend tests — full pytest suite, model providers MOCKED (from upstream ci.yml).
+  # ========================
+  backend:
+    name: Backend tests (mocked models, zero paid calls)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ inputs.target_ref }}"
+      - name: Show checked-out ref
+        run: |
+          echo "requested ref: ${{ inputs.target_ref }}"
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Run tests
+        run: cd backend && python -m pytest -q
+
+  # ========================
+  # Frontend build — vite production build (from upstream ci.yml).
+  # ========================
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ inputs.target_ref }}"
+      - name: Show checked-out ref
+        run: |
+          echo "requested ref: ${{ inputs.target_ref }}"
+          echo "checked-out SHA: $(git rev-parse HEAD)"
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: cd frontend && npm ci
+      - name: Production build
+        run: cd frontend && npm run build
