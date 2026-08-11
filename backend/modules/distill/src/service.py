@@ -15,11 +15,16 @@ from pathlib import Path
 
 from modules.graph.src.services import GraphService
 from modules.ingest.src.models import cap_note_id
+from modules.ingest.src.services import IngestService
 
 from .providers import SourceNote, Summarizer
 
 _CITE_RE = re.compile(r"\(vault:\s*([^)]+?)\s*\)")
 SUMMARY_REPO = "✦ summaries"
+# issue #9 — the one-click re-distill reads the summary's own provenance lines
+_DISTILLED_FROM_RE = re.compile(r"^synapse\.distilled_from:\s*(.+?)\s*$", re.MULTILINE)
+_DISTILL_SCOPE_RE = re.compile(r"^synapse\.distill_scope:\s*(\S+)\s*$", re.MULTILINE)
+_DISTILL_DEPTH_RE = re.compile(r"^synapse\.distill_depth:\s*(\d+)\s*$", re.MULTILINE)
 
 
 def citation_audit(markdown: str, known: set[str]) -> tuple[int, list[str]]:
@@ -149,12 +154,45 @@ class DistillService:
         return {"summary_note_id": note_id, "citations": citations, "truncated": truncated,
                 "tokens_est": est, "model": result.model, "sources": [n.note_id for n in notes]}
 
+    def redistill(self, summary_note_id: str, confirm: bool = False) -> dict:
+        """One-click re-distill (issue #9): re-run the distill that produced a summary,
+        from the summary note ALONE — root/scope/depth ride its frontmatter
+        (`synapse.distilled_from` / `distill_scope` / `distill_depth`). The fresh write
+        clears the stale flag and re-records the source hashes. The same spend gate and
+        grounding audit apply — a re-distill is a distill."""
+        path = self.vault_path / "notes" / summary_note_id
+        if (not path.is_file()
+                or path.parent.resolve() != (self.vault_path / "notes").resolve()):
+            raise KeyError(f"No note '{summary_note_id}' in the vault.")
+        # the WHOLE frontmatter, delimiter-bounded — never a fixed window: a long
+        # `synapse.source_hashes` line (many sources) would push `distilled_from` past
+        # any constant slice (same doctrine as ingest's _frontmatter_text, GBU P1)
+        fm = IngestService._frontmatter_text(path)
+        if "synapse.kind: summary" not in fm:
+            raise ValueError(f"'{summary_note_id}' is not a distilled summary.")
+        m = _DISTILLED_FROM_RE.search(fm)
+        if not m:
+            raise ValueError(
+                f"'{summary_note_id}' predates distill provenance (no synapse.distilled_from) "
+                "— re-distill it from its root note instead.")
+        scope_m, depth_m = _DISTILL_SCOPE_RE.search(fm), _DISTILL_DEPTH_RE.search(fm)
+        return self.distill(m.group(1),
+                            scope=scope_m.group(1) if scope_m else "node",
+                            depth=int(depth_m.group(1)) if depth_m else 2,
+                            confirm=confirm)
+
     def _write_summary(self, subject, root_id, scope, depth, notes, truncated, result) -> str:
         safe = re.sub(r"[/\\:*?\"<>|]", "·", subject)[:80].strip() or "note"
         # byte-cap, not char-cap: an emoji/CJK-heavy 80-char subject can exceed ext4's
         # 255-byte filename limit — same doctrine (and helper) as ingest note ids
         note_id = cap_note_id(f"S — {safe}.md")
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        # issue #9: the distill-time hash map — each cited source's content hash as it was
+        # when this summary was written. Ingest compares it against the vault on every sync
+        # and flags drift (`synapse.stale: true`); a re-distill rewrites this map fresh.
+        hash_map = " | ".join(
+            f"{n.note_id}={h}" for n in notes
+            if (h := IngestService.existing_hash(self.vault_path / "notes" / n.note_id)))
         fm = (
             "---\n"
             "synapse.kind: summary\n"
@@ -164,6 +202,12 @@ class DistillService:
             f"synapse.model: {result.model}\n"
             f"synapse.scope: {scope} (depth {depth if scope == 'subtree' else '-'})\n"
             f"synapse.sources: {', '.join(n.note_id for n in notes)}\n"
+            f"synapse.source_hashes: {hash_map}\n"
+            # machine-readable provenance for the one-click re-distill (`synapse.scope`
+            # above stays the human line — it predates this feature and is display-shaped)
+            f"synapse.distilled_from: {root_id}\n"
+            f"synapse.distill_scope: {scope}\n"
+            f"synapse.distill_depth: {depth}\n"
             "---\n"
         )
         trunc_note = ("\n> ⚠️ **Truncated:** the source set exceeded the size cap — this summary "

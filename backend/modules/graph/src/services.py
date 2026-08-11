@@ -21,7 +21,7 @@ from .models import Edge, Graph, Node
 _FM_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 _FM_FIELD_RE = re.compile(
     r"^synapse\.(source_repo|source_path|kind|asset_type|inferred_links|asset_refs"
-    r"|first_seen|file_mtime):\s*(.+?)\s*$",
+    r"|first_seen|file_mtime|stale):\s*(.+?)\s*$",
     re.MULTILINE)
 _TITLE_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]|#]+)(?:#[^\[\]|]*)?(?:\|[^\[\]]*)?\]\]")
@@ -74,6 +74,7 @@ class GraphService:
                 "file_mtime": fields.get("file_mtime", ""),
                 "inferred_links": fields.get("inferred_links", ""),
                 "asset_refs": fields.get("asset_refs", ""),
+                "stale": fields.get("stale", "") == "true",   # issue #9 — summaries only
             })
         return notes
 
@@ -122,6 +123,7 @@ class GraphService:
                 # their nature as a tag — the explorer draws the 📷/📄 glyph from it
                 tags=[f"asset:{n['asset_type']}"] if n["asset_type"] else [],
                 first_seen=n.get("first_seen", ""), file_mtime=n.get("file_mtime", ""),
+                stale=n["stale"],
             )
         for repo in sorted({n["repo"] for n in notes if n["repo"]}):
             g.nodes[f"repo:{repo}"] = Node(id=f"repo:{repo}", kind="repo", title=repo, repo=repo)

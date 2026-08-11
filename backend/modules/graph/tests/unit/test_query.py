@@ -21,7 +21,7 @@ def graph(tmp_path_factory) -> dict:
 
 class TestSchemaV3:
     def test_edges_carry_confidence_extracted_by_default(self, graph):
-        assert graph["schema_version"] == 4
+        assert graph["schema_version"] == 5
         assert graph["edges"], "fixture graph must have edges"
         assert all(e["confidence"] == "EXTRACTED" for e in graph["edges"])
         assert all("confidence_score" not in e for e in graph["edges"])   # EXTRACTED = 1.0 implicit

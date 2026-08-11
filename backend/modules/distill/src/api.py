@@ -45,6 +45,27 @@ def distill(req: DistillRequest) -> dict:
         raise HTTPException(status_code=422, detail=str(e))
 
 
+class RedistillRequest(BaseModel):
+    note_id: str             # the SUMMARY note — root/scope/depth ride its frontmatter
+    confirm: bool = False
+
+
+@router.post("/redistill")
+def redistill(req: RedistillRequest) -> dict:
+    """One-click re-distill of a (stale) summary — issue #9. The fresh write clears
+    `synapse.stale` and re-records the source hashes; same spend gate as /distill."""
+    try:
+        return _service().redistill(req.note_id, req.confirm)
+    except ConfirmationRequired as c:
+        return {"requires_confirmation": True, "tokens_est": c.tokens_est, "threshold": c.threshold}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e.args[0]))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except GroundingError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
 # ── The seeing pass (sprint 05, Epic L) ─────────────────────────────────────────
 
 class DescribeRequest(BaseModel):

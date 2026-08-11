@@ -193,15 +193,21 @@ window.toggleDistills = () => {
 function buildDistills() {
   const list = nodes.filter(n => n.kind === 'note' && n.repo === '✦ summaries')
     .sort((a, b) => a.title.localeCompare(b.title));
+  const staleCount = list.filter(n => n.stale).length;
   const rows = list.map(n => `
     <div class="row">
       <input type="checkbox" data-dsel="${esc(n.id)}" title="select for bulk delete" />
       <span data-open-note="${esc(n.id)}" title="${esc(n.title)}"
             style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">✦ ${esc(n.title.replace(/^\s*S\s*—\s*/, ''))}</span>
+      ${n.stale ? `<span style="color:var(--bad);white-space:nowrap"
+            title="a cited source changed since this summary was distilled">⚠ stale</span>
+      <button data-redistill="${esc(n.id)}" style="white-space:nowrap"
+            title="re-distill from the current sources (same root, scope and depth)">↻ re-distill</button>` : ''}
       <span class="rootcount">${n.in_degree + n.out_degree} links</span>
     </div>`).join('');
   $('distills').innerHTML =
     `<h4 style="display:flex">✦ Distills — your summaries (${list.length})
+       ${staleCount ? `<span style="color:var(--bad);font-weight:normal">&nbsp;· ${staleCount} stale</span>` : ''}
        <span style="margin-left:auto;cursor:pointer;color:var(--dim)" onclick="toggleDistills()">✕</span></h4>
      <div class="srcbtns">
        <button onclick="distillsSelectAll(true)">✓ Select all</button>
@@ -211,8 +217,32 @@ function buildDistills() {
     (rows || `<div class="row" style="color:var(--dim)">no distills yet — open a note and hit ✦ Distill</div>`) +
     `<p style="color:var(--dim);font-size:0.72rem;margin-top:0.5rem">
        Click a title to read it. Deleting removes the summary note AND its rendered image;
-       source notes are never touched.</p>`;
+       source notes are never touched. ⚠ stale = a cited source changed since the distill —
+       ↻ re-distill refreshes it from the current sources (stale summaries also wear an
+       amber ring on the canvas).</p>`;
 }
+// issue #9 — one-click re-distill: the summary note carries its own root/scope/depth,
+// so the click is JUST the note id. Same spend gate as a fresh distill.
+window.redistillNote = async (id) => {
+  $('ai-status').textContent = 're-distilling from the current sources…';
+  try {
+    let out = await api('/redistill', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note_id: id }) });
+    if (out.requires_confirmation) {
+      if (!(await appConfirm(`Re-distilling is ~${out.tokens_est.toLocaleString()} tokens (confirmation gate: ${out.threshold.toLocaleString()}).`,
+                             { title: 'Cost guard', ok: 'Spend it' }))) {
+        $('ai-status').textContent = 'cancelled — nothing spent'; return;
+      }
+      out = await api('/redistill', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note_id: id, confirm: true }) });
+    }
+    await api('/rebuild', { method: 'POST' });
+    await refresh();
+    buildDistills();
+    $('ai-status').textContent = `re-distilled ✓ ${out.citations} citation(s)` + (out.truncated ? ' · truncated (disclosed)' : '');
+    setMsg(`summary refreshed: ${out.summary_note_id} (${out.model})`);
+  } catch (e) { $('ai-status').textContent = e.message; setMsg(e.message, true); }
+};
 window.distillsSelectAll = (v) => {
   $('distills').querySelectorAll('input[data-dsel]').forEach(cb => { cb.checked = v; });
 };
@@ -237,6 +267,8 @@ window.deleteSelectedDistills = async () => {
   setMsg(`${done} distill(s) deleted + graph rebuilt`);
 };
 $('distills').addEventListener('click', (ev) => {
+  const rd = ev.target.closest('[data-redistill]');
+  if (rd) { redistillNote(rd.dataset.redistill); return; }
   const t = ev.target.closest('[data-open-note]');
   if (t) { window.__zoomNext = true; reader.openNote(t.dataset.openNote); }
 });
@@ -541,7 +573,10 @@ window.runIngest = async () => {
     const t = rep.totals;
     if (t.pruned > 0) { ac.prunedSeen = true; }   // acceptance s43: the sync pruned, honestly counted
     const assets = t.assets_found > 0 ? ` · ${t.assets_found} assets → ${t.assets_written} sidecars` : '';
-    setMsg(`ingest sync: ${t.files_found} found · ${t.notes_written} written · ${t.unchanged} unchanged · ${t.skipped} skipped · ${t.pruned} pruned${assets}`);
+    // issue #9: a flag that flips QUIETLY is the failure the issue exists to kill — say it
+    const ripple = rep.stale_summaries?.length
+      ? ` · ⚠ ${rep.stale_summaries.length} summar(y/ies) changed staleness (see ✦ Distills)` : '';
+    setMsg(`ingest sync: ${t.files_found} found · ${t.notes_written} written · ${t.unchanged} unchanged · ${t.skipped} skipped · ${t.pruned} pruned${assets}${ripple}`);
     setDirty(false);
     await refresh();
     // an open Sources panel must recount — founder repro: root said "828 notes" while the

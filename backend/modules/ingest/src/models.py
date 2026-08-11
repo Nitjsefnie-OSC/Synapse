@@ -112,6 +112,9 @@ class IngestReport:
     repos: list[RepoReport] = field(default_factory=list)
     pruned: int = 0            # notes removed by the sync (disabled roots / deleted sources)
     errors: list[str] = field(default_factory=list)   # unreadable paths etc. — reported, never fatal
+    # issue #9: summaries whose stale flag CHANGED this sync (either direction) — the UI
+    # toasts it, the CLI prints it; a quiet flag flip is the exact failure the issue kills
+    stale_summaries: list[str] = field(default_factory=list)
 
     @property
     def files_found(self) -> int:
@@ -150,6 +153,7 @@ class IngestReport:
                 "assets_written": self.assets_written,
             },
             "errors": self.errors[:50],
+            "stale_summaries": self.stale_summaries[:50],
         }
 
     def render(self) -> str:
@@ -169,4 +173,8 @@ class IngestReport:
         if self.errors:
             lines.append(f"  ERRORS ({len(self.errors)}): " + "; ".join(self.errors[:5]) +
                          (" …" if len(self.errors) > 5 else ""))
+        if self.stale_summaries:
+            lines.append(f"  RIPPLE: {len(self.stale_summaries)} summar(y/ies) changed staleness: "
+                         + ", ".join(self.stale_summaries[:5]) +
+                         (" …" if len(self.stale_summaries) > 5 else ""))
         return "\n".join(lines)

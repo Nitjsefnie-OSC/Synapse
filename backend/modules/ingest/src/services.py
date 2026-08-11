@@ -34,6 +34,13 @@ _FILE_MTIME_RE = re.compile(r"^synapse\.file_mtime:\s*(\S+)\s*$", re.MULTILINE)
 _REFS_RE = re.compile(r"^synapse\.asset_refs:\s*(.*?)\s*$", re.MULTILINE)
 _REPO_RE = re.compile(r"^synapse\.source_repo:\s*(.+?)\s*$", re.MULTILINE)
 _FM_KEY_RE = re.compile(r"^synapse\.[a-z_]+:", re.MULTILINE)
+# Issue #9 (ripple maintenance): a distilled summary records each cited source's content
+# hash at distill time (`synapse.source_hashes: <note_id>=<sha256> | …`); ingest compares
+# them against the notes NOW in the vault and flags drift with `synapse.stale: true`.
+_SUMMARY_KIND_RE = re.compile(r"^synapse\.kind:\s*summary\s*$", re.MULTILINE)
+_SOURCE_HASHES_RE = re.compile(r"^synapse\.source_hashes:\s*(.*?)\s*$", re.MULTILINE)
+_STALE_LINE_RE = re.compile(r"^synapse\.stale: true\n", re.MULTILINE)
+_HASH_PAIR_RE = re.compile(r"\A(.+)=([0-9a-f]{64})\Z")
 FRONTMATTER_END = "---"
 
 
@@ -432,10 +439,13 @@ class IngestService:
         m = _FIRST_SEEN_RE.search(self._frontmatter_text(note_path))
         return m.group(1) if m else None
 
-    def existing_hash(self, note_path: Path) -> str | None:
+    @staticmethod
+    def existing_hash(note_path: Path) -> str | None:
+        """The `synapse.content_hash` on disk (staticmethod: distill reads it too, to record
+        each source's hash at distill time — issue #9)."""
         if not note_path.is_file():
             return None
-        m = _HASH_RE.search(self._frontmatter_text(note_path))
+        m = _HASH_RE.search(IngestService._frontmatter_text(note_path))
         return m.group(1) if m else None
 
     def write_note(self, src: SourceFile, errors: list[str] | None = None) -> str:
@@ -489,6 +499,64 @@ class IngestService:
                 errors.append(f"{note_path.name}: {getattr(e, 'strerror', e)}")
             return "skipped"
         return "written"
+
+    # ── ripple maintenance (issue #9) ─────────────────────────────────────
+    def refresh_summary_staleness(self, errors: list[str] | None = None) -> list[str]:
+        """Flag/unflag `synapse.stale: true` on every distilled summary in the vault, by
+        comparing the source hashes recorded at distill time against the notes NOW on disk.
+        An edited source stales the summary; so does a pruned one (a hash that can no
+        longer be read IS a change). A reverted source clears the flag — this is a
+        comparison, not a one-way latch. Summaries without `synapse.source_hashes`
+        (distilled before this feature) are skipped: nothing to compare, never guessed.
+        Returns the note ids whose flag changed. Never fatal — a flag that can't be
+        written is recorded, never aborts the sync."""
+        if not self.notes_dir.is_dir():
+            return []
+        changed: list[str] = []
+        for note in sorted(self.notes_dir.glob("*.md")):
+            fm = self._frontmatter_text(note)
+            if not fm or not _SUMMARY_KIND_RE.search(fm):
+                continue   # only distill artifacts carry staleness
+            m = _SOURCE_HASHES_RE.search(fm)
+            if not m or not m.group(1):
+                continue   # pre-#9 summary — honest absence
+            stale = False
+            for token in m.group(1).split(" | "):
+                pair = _HASH_PAIR_RE.match(token.strip())
+                if not pair or Path(pair.group(1)).name != pair.group(1):
+                    continue   # malformed/hand-edited token — not evidence either way
+                if self.existing_hash(self.notes_dir / pair.group(1)) != pair.group(2):
+                    stale = True
+                    break
+            if stale != (_STALE_LINE_RE.search(fm) is not None):
+                self._write_stale_flag(note, stale, errors)
+                changed.append(note.name)
+        return changed
+
+    @staticmethod
+    def _write_stale_flag(note_path: Path, stale: bool, errors: list[str] | None) -> None:
+        """Insert/remove the `synapse.stale: true` frontmatter line (atomic write, like every
+        other vault write). Only the flag line is ever touched — the summary body and the
+        distill-time hash map are user artifacts and stay byte-identical."""
+        try:
+            text = note_path.read_text(encoding="utf-8", errors="replace")
+            if stale:
+                # group(0) stops BEFORE the line's "\n" (it backtracks off `\s*$`), so the
+                # newline is re-added here — gluing the flag onto the anchor line would
+                # corrupt BOTH frontmatter fields
+                new = _SUMMARY_KIND_RE.sub(lambda m: m.group(0) + "\nsynapse.stale: true",
+                                           text, count=1)
+                if new == text:
+                    return   # no anchor line — never invent frontmatter on a foreign note
+            else:
+                new = _STALE_LINE_RE.sub("", text, count=1)
+            tmp = note_path.parent / f"{note_path.name}.{os.getpid()}.tmp"
+            tmp.write_text(new, encoding="utf-8")
+            os.replace(tmp, note_path)
+        except OSError as e:
+            if errors is not None:
+                errors.append(f"{note_path.name}: could not write the stale flag "
+                              f"({getattr(e, 'strerror', e)})")
 
     # ── the pipeline ──────────────────────────────────────────────────────
     def ingest(self, repos: Iterable[Path], managed_names: set[str] | None = None,
@@ -546,4 +614,7 @@ class IngestService:
                 if repo not in enabled_names or note.name not in expected:
                     note.unlink(missing_ok=True)
                     report.pruned += 1
+        # ripple maintenance (issue #9): AFTER the sync + prune, so the comparison sees
+        # the vault as it now stands — a pruned source stales its summaries too.
+        report.stale_summaries = self.refresh_summary_staleness(errors=report.errors)
         return report

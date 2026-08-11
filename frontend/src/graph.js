@@ -435,6 +435,13 @@ export function createGraph(canvas, { tooltipEl, infoEl, onNodeClick }) {
         ctx.strokeStyle = '#e6e6e6'; ctx.lineWidth = 1.6;
         ctx.beginPath(); ctx.arc(p.x, p.y, r + 4.5, 0, 7); ctx.stroke();
       }
+      // issue #9: a STALE summary (a cited source changed since distill time) wears an
+      // amber ring at every zoom — a badge you can only see at one zoom level is the
+      // quiet-staleness failure all over again. Re-distill from the distills panel.
+      if (n.stale && !dim) {
+        ctx.strokeStyle = 'rgba(255,176,32,0.9)'; ctx.lineWidth = 1.8;
+        ctx.beginPath(); ctx.arc(p.x, p.y, r + 6, 0, 7); ctx.stroke();
+      }
       // labels: hovered + small neighborhoods always; zoomed-in hubs pass the DECLUTTER grid
       const label = sim.hover === n.id || (hood?.has(n.id) && hood.size < 14) ||
                     (inMatch && matchSet.size <= 15) ||

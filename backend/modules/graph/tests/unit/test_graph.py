@@ -83,7 +83,7 @@ class TestRebuildInvariance:
     def test_schema_versioned(self, vault):
         service = GraphService(vault)
         service.rebuild()
-        assert json.loads(service.graph_file.read_text(encoding="utf-8"))["schema_version"] == 4
+        assert json.loads(service.graph_file.read_text(encoding="utf-8"))["schema_version"] == 5
 
 
 class TestIndexAndStats:

@@ -72,7 +72,7 @@ def test_graph_surfaces_the_fields(tmp_path, repo):
     svc = _svc(tmp_path)
     svc.write_note(_src(repo))
     g = GraphService(svc.notes_dir.parent).rebuild().to_dict()
-    assert g["schema_version"] == 4
+    assert g["schema_version"] == 5
     note = next(n for n in g["nodes"] if n["kind"] == "note")
     assert note["first_seen"] and note["file_mtime"]
 

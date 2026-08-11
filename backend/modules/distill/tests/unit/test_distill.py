@@ -170,6 +170,139 @@ class TestDistill:
         assert "Truncated" in note
 
 
+class TestStaleness:
+    """Issue #9 — a distilled `S —` summary goes quietly stale when its cited sources
+    change. Distill records each source's content hash; ingest compares and flags."""
+
+    @staticmethod
+    def _fm(note_path: Path) -> str:
+        text = note_path.read_text(encoding="utf-8")
+        return text.split("---\n", 2)[1] if text.startswith("---\n") else ""
+
+    @pytest.fixture
+    def editable_vault(self, tmp_path):
+        """repo_a copied into tmp — the shared fixture must never be edited in place.
+        The copy keeps the name `repo_a` so note ids match the shared constants."""
+        import shutil
+        repo = tmp_path / "repo_a"
+        shutil.copytree(FIXTURES / "repo_a", repo, ignore=shutil.ignore_patterns("node_modules"))
+        v = tmp_path / "vault"
+        ing = IngestService(v, IGNORE)
+        ing.ingest([repo])
+        return v, repo, ing
+
+    def test_distill_records_source_hashes_and_is_not_born_stale(self, editable_vault):
+        v, _, _ = editable_vault
+        out = DistillService(v, MockSummarizer()).distill(ALPHA, scope="subtree", depth=1)
+        fm = self._fm(v / "notes" / out["summary_note_id"])
+        assert "synapse.source_hashes:" in fm          # the distill-time hash map
+        assert "synapse.stale" not in fm               # a fresh distill is not born stale
+
+    def test_cited_source_edit_marks_stale_and_redistill_clears(self, editable_vault):
+        """The issue's acceptance, end to end on the mock: edit a cited source →
+        re-ingest → the summary carries the stale flag; re-distill → the flag clears."""
+        v, repo, ing = editable_vault
+        svc = DistillService(v, MockSummarizer())
+        out = svc.distill(ALPHA, scope="subtree", depth=1)
+        summary = v / "notes" / out["summary_note_id"]
+        # a summary of an UNRELATED note — the invariant is "a summary whose CITED sources
+        # changed is stale", never "any edit stales every summary"
+        other = svc.distill("repo_a__hebrew.md", scope="node")
+        other_note = v / "notes" / other["summary_note_id"]
+
+        alpha = repo / "docs" / "alpha.md"
+        alpha.write_text(alpha.read_text(encoding="utf-8") + "\nthe ripple edit\n",
+                         encoding="utf-8")
+        ing.ingest([repo])
+        assert "synapse.stale: true" in self._fm(summary)     # ← the acceptance assertion
+        assert "synapse.stale" not in self._fm(other_note)    # untouched summaries stay fresh
+
+        svc.distill(ALPHA, scope="subtree", depth=1)          # re-distill overwrites…
+        assert "synapse.stale" not in self._fm(summary)       # …and the flag clears
+
+    def test_reverted_source_clears_the_flag_on_ingest(self, editable_vault):
+        """The flag is a honest COMPARISON, not a one-way latch: a source reverted to its
+        distilled content (same hash) makes the summary fresh again on the next ingest."""
+        v, repo, ing = editable_vault
+        svc = DistillService(v, MockSummarizer())
+        out = svc.distill(ALPHA, scope="subtree", depth=1)
+        summary = v / "notes" / out["summary_note_id"]
+        alpha = repo / "docs" / "alpha.md"
+        original = alpha.read_bytes()
+        alpha.write_bytes(original + b"\nthe ripple edit\n")
+        ing.ingest([repo])
+        assert "synapse.stale: true" in self._fm(summary)
+        alpha.write_bytes(original)
+        ing.ingest([repo])
+        assert "synapse.stale" not in self._fm(summary)
+
+    def test_summary_without_recorded_hashes_is_left_alone(self, editable_vault):
+        """Summaries distilled before this feature carry no `synapse.source_hashes` —
+        nothing to compare against, so they are honestly UNMARKED, never guessed stale."""
+        v, repo, ing = editable_vault
+        svc = DistillService(v, MockSummarizer())
+        out = svc.distill(ALPHA, scope="subtree", depth=1)
+        summary = v / "notes" / out["summary_note_id"]
+        text = summary.read_text(encoding="utf-8")
+        import re as _re
+        summary.write_text(_re.sub(r"^synapse\.source_hashes:.*\n", "", text, flags=_re.M),
+                           encoding="utf-8")
+        alpha = repo / "docs" / "alpha.md"
+        alpha.write_text(alpha.read_text(encoding="utf-8") + "\nedit\n", encoding="utf-8")
+        ing.ingest([repo])
+        assert "synapse.stale" not in self._fm(summary)
+
+    def test_pruned_source_marks_the_summary_stale(self, editable_vault):
+        """A cited source that VANISHED (deleted file → pruned note) is a change too —
+        the summary no longer reflects the vault it was distilled from."""
+        v, repo, ing = editable_vault
+        svc = DistillService(v, MockSummarizer())
+        out = svc.distill(ALPHA, scope="subtree", depth=1)
+        summary = v / "notes" / out["summary_note_id"]
+        (repo / "docs" / "alpha.md").unlink()
+        ing.ingest([repo], managed_names={"repo_a"})
+        assert "synapse.stale: true" in self._fm(summary)
+
+    def test_one_click_redistill_uses_the_recorded_root_and_clears_stale(self, editable_vault):
+        """The UI's one-click re-distill: from the summary note ALONE (its recorded root /
+        scope / depth), re-run the distill — the fresh write clears the flag."""
+        v, repo, ing = editable_vault
+        svc = DistillService(v, MockSummarizer())
+        out = svc.distill(ALPHA, scope="subtree", depth=1)
+        summary = v / "notes" / out["summary_note_id"]
+        alpha = repo / "docs" / "alpha.md"
+        alpha.write_text(alpha.read_text(encoding="utf-8") + "\nedit\n", encoding="utf-8")
+        ing.ingest([repo])
+        assert "synapse.stale: true" in self._fm(summary)
+        result = svc.redistill(out["summary_note_id"])
+        assert result["summary_note_id"] == out["summary_note_id"]   # same subject, same note
+        assert "synapse.stale" not in self._fm(summary)
+
+    def test_redistill_rejects_a_note_that_is_not_a_summary(self, editable_vault):
+        v, _, _ = editable_vault
+        svc = DistillService(v, MockSummarizer())
+        with pytest.raises(ValueError, match="not a distilled summary"):
+            svc.redistill(ALPHA)
+        with pytest.raises(KeyError):
+            svc.redistill("ghost.md")
+
+    def test_stale_flag_surfaces_in_the_graph_for_the_ui(self, editable_vault):
+        """The ✦ badge rides graph.json: a stale summary's node carries `stale: true`,
+        a fresh one carries nothing (absent, never false — the v4 doctrine)."""
+        from modules.graph.src.services import GraphService
+        v, repo, ing = editable_vault
+        svc = DistillService(v, MockSummarizer())
+        out = svc.distill(ALPHA, scope="subtree", depth=1)
+        alpha = repo / "docs" / "alpha.md"
+        alpha.write_text(alpha.read_text(encoding="utf-8") + "\nedit\n", encoding="utf-8")
+        ing.ingest([repo])
+        node = GraphService(v).build().nodes[out["summary_note_id"]].to_dict()
+        assert node.get("stale") is True
+        svc.distill(ALPHA, scope="subtree", depth=1)
+        node = GraphService(v).build().nodes[out["summary_note_id"]].to_dict()
+        assert "stale" not in node
+
+
 class TestDescribe:
     """Sprint 05 Epic L — the seeing pass (all on MockVisionDescriber, zero cost)."""
 

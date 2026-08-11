@@ -5,7 +5,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-SCHEMA_VERSION = 4   # v4 (sprint 06 S1/S2): + node `first_seen` / `file_mtime` (both optional —
+SCHEMA_VERSION = 5   # v5 (issue #9): + node `stale` (optional, true-only) — a distilled
+                     #     summary whose cited sources changed since distill time. Absent
+                     #     means fresh-or-untracked, never false.
+                     # v4 (sprint 06 S1/S2): + node `first_seen` / `file_mtime` (both optional —
                      #     a graph written before v4 loads with them ABSENT, never back-dated)
                      # v3 (Epic J): + edge `confidence` — EXTRACTED (parsed, 1.0) | INFERRED
 #                      (AI-derived, discrete score 0.55–0.95) | AMBIGUOUS (flagged for review).
@@ -29,6 +32,9 @@ class Node:
     # never back-dated — an invented date is worse than an absent one.
     first_seen: str = ""
     file_mtime: str = ""
+    # issue #9: a summary whose cited sources drifted from the distill-time hashes. Same
+    # doctrine as the time fields — serialized ONLY when true; absent is the fresh case.
+    stale: bool = False
 
     def to_dict(self) -> dict:
         d = {
@@ -42,6 +48,8 @@ class Node:
             d["first_seen"] = self.first_seen
         if self.file_mtime:
             d["file_mtime"] = self.file_mtime
+        if self.stale:
+            d["stale"] = True
         return d
 
 

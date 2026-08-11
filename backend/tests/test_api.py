@@ -42,7 +42,7 @@ def test_ingest_then_graph_roundtrip(client):
     assert rebuild["notes"] == 4
 
     graph = client.get("/api/v1/graph").json()
-    assert graph["schema_version"] == 4
+    assert graph["schema_version"] == 5
     assert len([n for n in graph["nodes"] if n["kind"] == "note"]) == 4
 
     stats = client.get("/api/v1/stats").json()
@@ -85,6 +85,39 @@ def test_distill_and_render_in_mock_mode(client, monkeypatch):
 
     note = client.get(f"/api/v1/note/{out['summary_note_id']}").json()
     assert "mock distillation" in note["body"]
+
+
+def test_redistill_endpoint_roundtrip(client, tmp_path, monkeypatch):
+    """Issue #9 over HTTP: edit a cited source → re-ingest → the summary is reported stale
+    and its graph node carries the badge flag → one click on /redistill clears it.
+    repo_a is copied into tmp — the shared fixture must never be edited in place."""
+    import shutil
+    repo = tmp_path / "repo_a"
+    shutil.copytree(FIXTURES / "repo_a", repo, ignore=shutil.ignore_patterns("node_modules"))
+    monkeypatch.setenv("SYNAPSE_SOURCE_REPOS", str(repo))
+    monkeypatch.setenv("SYNAPSE_MOCK_MODELS", "1")
+    client.post("/api/v1/ingest")
+    client.post("/api/v1/rebuild")
+    out = client.post("/api/v1/distill",
+                      json={"node_id": "repo_a__docs__alpha.md", "scope": "subtree", "depth": 1}).json()
+    sid = out["summary_note_id"]
+
+    alpha = repo / "docs" / "alpha.md"
+    alpha.write_text(alpha.read_text(encoding="utf-8") + "\nthe ripple edit\n", encoding="utf-8")
+    rep = client.post("/api/v1/ingest").json()
+    assert sid in rep["stale_summaries"]            # the ingest report SAYS it, not just flags it
+    client.post("/api/v1/rebuild")
+    node = next(n for n in client.get("/api/v1/graph").json()["nodes"] if n["id"] == sid)
+    assert node.get("stale") is True                # the ✦ badge rides graph.json
+
+    assert client.post("/api/v1/redistill", json={"note_id": "ghost.md"}).status_code == 404
+    assert client.post("/api/v1/redistill",
+                       json={"note_id": "repo_a__docs__alpha.md"}).status_code == 422   # not a summary
+    out2 = client.post("/api/v1/redistill", json={"note_id": sid}).json()
+    assert out2["summary_note_id"] == sid           # same subject → same note, refreshed
+    client.post("/api/v1/rebuild")
+    node = next(n for n in client.get("/api/v1/graph").json()["nodes"] if n["id"] == sid)
+    assert "stale" not in node
 
 
 def test_model_endpoints_fail_actionably_without_keys(client, monkeypatch):
