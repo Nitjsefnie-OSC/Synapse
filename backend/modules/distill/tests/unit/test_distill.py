@@ -292,6 +292,42 @@ class TestStaleness:
         ing.ingest([repo])
         assert "synapse.stale" not in self._fm(summary)
 
+    def test_adversarial_filenames_roundtrip_the_hash_map(self, tmp_path):
+        """Second-round fix — the failure CLASS, not one instance: the map is a single-line
+        JSON object, so ANY filename a filesystem permits must round-trip exactly. Driven
+        end-to-end (ingest → distill → re-ingest) over adversarial note ids: the two live
+        instances the delta probe found (an id containing the pair-anchor `=<64 hex> | `
+        verbatim; an id containing a NEWLINE — legal on Linux/macOS), the old ` | `
+        separator, both quote kinds, and a plain control. Each must parse back EXACTLY,
+        never false-stale on an unchanged sync, and still stale on a real edit (tracked,
+        not skipped)."""
+        import json
+        h64 = "0123456789abcdef" * 4
+        fnames = ["plain.md", "a | b.md", f"a={h64} | b.md", "x\ny.md", 'quo"te\'s.md']
+        for i, fname in enumerate(fnames):
+            case = tmp_path / f"case{i}"
+            repo = case / "repo"
+            repo.mkdir(parents=True)
+            (repo / fname).write_text("# probe\n\nthe body\n", encoding="utf-8")
+            v = case / "vault"
+            ing = IngestService(v, IGNORE)
+            ing.ingest([repo])
+            note_id = f"repo__{fname}"
+            svc = DistillService(v, MockSummarizer())
+            out = svc.distill(note_id, scope="node")
+            summary = v / "notes" / out["summary_note_id"]
+            line = next(ln for ln in self._fm(summary).splitlines()
+                        if ln.startswith("synapse.source_hashes:"))
+            recorded = json.loads(line.split(":", 1)[1].strip())
+            assert recorded == {note_id: IngestService.existing_hash(v / "notes" / note_id)}, fname
+            ing.ingest([repo])                                   # nothing changed…
+            assert "synapse.stale" not in self._fm(summary), fname   # …so nothing may stale
+            src = repo / fname
+            src.write_text(src.read_text(encoding="utf-8") + "\nthe ripple edit\n",
+                           encoding="utf-8")
+            ing.ingest([repo])
+            assert "synapse.stale: true" in self._fm(summary), fname   # genuinely tracked
+
     def test_one_click_redistill_uses_the_recorded_root_and_clears_stale(self, editable_vault):
         """The UI's one-click re-distill: from the summary note ALONE (its recorded root /
         scope / depth), re-run the distill — the fresh write clears the flag."""

@@ -13,6 +13,7 @@ Binding constraints (see project-management/sprints/sprint_01/todo/EPIC_A_ingest
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from datetime import datetime, timezone
@@ -35,19 +36,41 @@ _REFS_RE = re.compile(r"^synapse\.asset_refs:\s*(.*?)\s*$", re.MULTILINE)
 _REPO_RE = re.compile(r"^synapse\.source_repo:\s*(.+?)\s*$", re.MULTILINE)
 _FM_KEY_RE = re.compile(r"^synapse\.[a-z_]+:", re.MULTILINE)
 # Issue #9 (ripple maintenance): a distilled summary records each cited source's content
-# hash at distill time (`synapse.source_hashes: <note_id>=<sha256> | …`); ingest compares
-# them against the notes NOW in the vault and flags drift with `synapse.stale: true`.
+# hash at distill time; ingest compares them against the notes NOW in the vault and flags
+# drift with `synapse.stale: true`. The map is a SINGLE-LINE JSON OBJECT
+# (`synapse.source_hashes: {"<note_id>": "<sha256>", …}`) — JSON string encoding escapes
+# every byte a filesystem permits in a filename (pipes, `=`, quotes, even newlines), so NO
+# note id can break the map's framing. This replaced a hand-rolled `id=hash | …` line whose
+# delimiters could occur INSIDE an id ("Meeting | notes.md"; "a=<64 hex> | b.md"; a name
+# with a newline) — patched twice at the separator, the failure class survived both times.
 _SUMMARY_KIND_RE = re.compile(r"^synapse\.kind:\s*summary\s*$", re.MULTILINE)
 _SOURCE_HASHES_RE = re.compile(r"^synapse\.source_hashes:\s*(.*?)\s*$", re.MULTILINE)
 _STALE_LINE_RE = re.compile(r"^synapse\.stale: true\n", re.MULTILINE)
-# One `<note_id>=<sha256>` pair, matched at a position and anchored on the hash: the id is
-# everything up to the FIRST `=<64 hex>` followed by the ` | ` separator or end-of-line.
-# The anchor is what makes a note id containing " | " (a legal filename — "Meeting |
-# notes.md" → `repo__Meeting | notes.md`) parse unambiguously: splitting the line on the
-# separator would yield a bogus `notes.md=<hash>` token that resolves to a nonexistent
-# note and marks the summary stale FOREVER (a re-distill rewrites the same map).
-_HASH_PAIR_RE = re.compile(r"(.+?)=([0-9a-f]{64})(?: \| |\Z)")
 FRONTMATTER_END = "---"
+
+
+def encode_source_hashes(hashes: dict[str, str]) -> str:
+    """The `synapse.source_hashes` value: {note_id: sha256} as ONE JSON line. `ensure_ascii`
+    off keeps Hebrew/emoji ids readable — JSON never emits raw control characters, so the
+    line stays single-line (and YAML-frontmatter-safe) for ANY id. Key order is the distill
+    citation order, so an unchanged source set re-encodes byte-identically."""
+    return json.dumps(hashes, ensure_ascii=False)
+
+
+def parse_source_hashes(line: str) -> dict[str, str] | None:
+    """Decode a `synapse.source_hashes` value back to {note_id: sha256}. Returns None when
+    the value is NOT the JSON map — a pre-fix `id=hash | …` summary or a hand-edited line.
+    Never guesses: an undecodable map carries no trustworthy pairs, so it is treated as
+    "no recorded hashes" (and surfaced by the caller, not silently dropped)."""
+    try:
+        data = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        return None
+    return data
 
 
 def is_vault_dir(path: Path) -> bool:
@@ -514,6 +537,8 @@ class IngestService:
         longer be read IS a change). A reverted source clears the flag — this is a
         comparison, not a one-way latch. Summaries without `synapse.source_hashes`
         (distilled before this feature) are skipped: nothing to compare, never guessed.
+        A summary whose map line is present but UNDECODABLE (pre-fix format, hand-edited)
+        is likewise never guessed stale — but it is surfaced in `errors`, not ignored.
         Returns the note ids whose flag changed. Never fatal — a flag that can't be
         written is recorded, never aborts the sync."""
         if not self.notes_dir.is_dir():
@@ -526,18 +551,22 @@ class IngestService:
             m = _SOURCE_HASHES_RE.search(fm)
             if not m or not m.group(1):
                 continue   # pre-#9 summary — honest absence
-            # NEVER split the line on " | " — a note id can contain the separator verbatim
-            # (see _HASH_PAIR_RE). Walk it left to right, one anchored pair at a time.
+            recorded = parse_source_hashes(m.group(1))
+            if recorded is None:
+                # A map line that is present but undecodable (pre-fix `id=hash | …`
+                # format, or a hand-edited line) is NOT evidence of drift either way —
+                # but it must be VISIBLE, never silently abandoned (the old pair-walk
+                # `break`ed on unparsable residue and dropped the rest of the line
+                # without a trace). Surface it; a re-distill rewrites the map fresh.
+                if errors is not None:
+                    errors.append(f"{note.name}: unreadable synapse.source_hashes map — "
+                                  "re-distill to rewrite it")
+                continue
             stale = False
-            pos, line = 0, m.group(1)
-            while pos < len(line):
-                pair = _HASH_PAIR_RE.match(line, pos)
-                if not pair:
-                    break   # malformed/hand-edited residue — not evidence either way
-                pos = pair.end()
-                if Path(pair.group(1)).name != pair.group(1):
+            for note_id, recorded_hash in recorded.items():
+                if Path(note_id).name != note_id:
                     continue   # an id is a bare filename, never a path
-                if self.existing_hash(self.notes_dir / pair.group(1)) != pair.group(2):
+                if self.existing_hash(self.notes_dir / note_id) != recorded_hash:
                     stale = True
                     break
             if stale != (_STALE_LINE_RE.search(fm) is not None):

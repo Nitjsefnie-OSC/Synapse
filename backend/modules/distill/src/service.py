@@ -15,7 +15,7 @@ from pathlib import Path
 
 from modules.graph.src.services import GraphService
 from modules.ingest.src.models import cap_note_id
-from modules.ingest.src.services import IngestService
+from modules.ingest.src.services import IngestService, encode_source_hashes
 
 from .providers import SourceNote, Summarizer
 
@@ -190,9 +190,12 @@ class DistillService:
         # issue #9: the distill-time hash map — each cited source's content hash as it was
         # when this summary was written. Ingest compares it against the vault on every sync
         # and flags drift (`synapse.stale: true`); a re-distill rewrites this map fresh.
-        hash_map = " | ".join(
-            f"{n.note_id}={h}" for n in notes
-            if (h := IngestService.existing_hash(self.vault_path / "notes" / n.note_id)))
+        # The map is ONE JSON line: note ids embed raw filenames, and a legal filename can
+        # contain any delimiter a hand-rolled format would pick — JSON escapes by
+        # construction, so no id can break the framing.
+        hash_map = encode_source_hashes({
+            n.note_id: h for n in notes
+            if (h := IngestService.existing_hash(self.vault_path / "notes" / n.note_id))})
         fm = (
             "---\n"
             "synapse.kind: summary\n"

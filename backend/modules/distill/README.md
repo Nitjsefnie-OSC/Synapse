@@ -18,10 +18,12 @@ sources wikilinked (so the next rebuild adds the summary to the graph, in its ow
 - Live smoke: opt-in `RUN_LIVE_DISTILL_SMOKE=1` (never CI).
 
 **Ripple maintenance (issue #9):** every summary records `synapse.source_hashes:
-<note_id>=<sha256> | …` — each cited source's content hash at distill time. Ingest compares
-that map against the vault on every sync and flags drift with `synapse.stale: true` (edited
-OR pruned source); a re-distill rewrites the map fresh and the flag clears. The graph carries
-`stale: true` on the node (schema v5) so the UI can badge it.
+{"<note_id>": "<sha256>", …}` — a single-line JSON object with each cited source's content
+hash at distill time (JSON because note ids embed raw filenames, and a legal filename can
+contain any hand-rolled delimiter — pipes, `=<64 hex> | `, quotes, even a newline). Ingest
+compares that map against the vault on every sync and flags drift with `synapse.stale:
+true` (edited OR pruned source); a re-distill rewrites the map fresh and the flag clears.
+The graph carries `stale: true` on the node (schema v5) so the UI can badge it.
 
 Deviation from the epic card (recorded): source-note backlinks are NOT written into source
 frontmatter — re-ingest would erase them; the graph provides reverse edges once the summary

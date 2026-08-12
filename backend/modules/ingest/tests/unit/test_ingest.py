@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from modules.ingest.src.services import IngestService
+from modules.ingest.src.services import IngestService, encode_source_hashes, parse_source_hashes
 
 FIXTURES = Path(__file__).resolve().parents[4] / "tests" / "fixtures"
 REPO_A = FIXTURES / "repo_a"
@@ -182,3 +182,54 @@ class TestIngest:
         report = service.ingest([repo])
         assert report.notes_written == 1 and report.unchanged == 0
         assert "# v2 changed" in (service.notes_dir / "live_repo__note.md").read_text(encoding="utf-8")
+
+
+class TestSourceHashesCodec:
+    """Issue #9, second round — the staleness map is a SINGLE-LINE JSON OBJECT, so no note
+    id can break its framing: a legal filename may contain the old ` | ` separator, the
+    pair-anchor `=<64 hex> | `, both quote kinds, even a NEWLINE, and JSON string encoding
+    escapes all of it by construction. Property-style: every adversarial id below must
+    round-trip EXACTLY — the failure class is closed, not one instance at a time."""
+
+    HEX = "0123456789abcdef" * 4
+    ADVERSARIAL_IDS = [
+        "plain.md",                            # control
+        "a | b.md",                            # the old separator, verbatim
+        f"a={HEX} | b.md",                     # the pair-anchor pattern, verbatim
+        "x\ny.md",                             # a newline is a legal filename byte
+        'quo"te\'s.md',                        # both quote kinds
+        "key=value.md",                        # a bare '='
+        " spaced .md",                         # leading/inner spaces
+    ]
+
+    def test_every_adversarial_id_roundtrips_exactly(self):
+        for note_id in self.ADVERSARIAL_IDS:
+            line = encode_source_hashes({note_id: self.HEX})
+            assert "\n" not in line and "\r" not in line   # always ONE frontmatter line
+            assert parse_source_hashes(line) == {note_id: self.HEX}
+
+    def test_several_adversarial_ids_in_one_map(self):
+        recorded = dict.fromkeys(self.ADVERSARIAL_IDS, self.HEX)
+        assert parse_source_hashes(encode_source_hashes(recorded)) == recorded
+
+    def test_unparsable_map_is_none_never_a_guess(self):
+        # the pre-fix `id=hash | …` format and hand-edited garbage both decode to None —
+        # the caller treats them as "no recorded hashes" and SURFACES the line, never
+        # silently walks off it
+        assert parse_source_hashes(f"plain.md={self.HEX}") is None
+        assert parse_source_hashes("{not json") is None
+        assert parse_source_hashes('["a", "list", "is", "not", "a", "map"]') is None
+
+    def test_unparsable_map_on_disk_is_surfaced_never_silently_skipped(self, service):
+        """The old stale-walk `break`ed on unparsable residue, abandoning the rest of the
+        line without a trace. Now a summary whose map line cannot be decoded is reported
+        in the ingest errors (VISIBLE) and its staleness is left UNTOUCHED — an unreadable
+        map is not evidence of drift either way; a re-distill rewrites it."""
+        service.notes_dir.mkdir(parents=True, exist_ok=True)
+        summary = service.notes_dir / "S — hand-edited.md"
+        summary.write_text("---\nsynapse.kind: summary\n"
+                           f"synapse.source_hashes: plain.md={self.HEX}\n"   # pre-fix format
+                           "---\nbody\n", encoding="utf-8")
+        report = service.ingest([REPO_A])
+        assert any("source_hashes" in e and summary.name in e for e in report.errors)
+        assert "synapse.stale" not in summary.read_text(encoding="utf-8")

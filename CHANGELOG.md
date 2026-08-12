@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-recording the hashes. The same spend gate and grounding audit apply: a re-distill is
   a distill.
 
+### Fixed
+- **Staleness map encoding is now unambiguous** (issue #9) — `synapse.source_hashes` is a
+  single-line JSON object (`{"<note_id>": "<sha256>", …}`), not a hand-rolled
+  `id=hash | …` line. Note ids embed raw filenames, and a legal filename can contain the
+  old separator, the pair-anchor `=<64 hex> | `, quotes, or even a newline — two live
+  instances of permanent-staleness / silently-untracked sources survived the first
+  separator patch. JSON escapes by construction, so any filename the filesystem permits
+  round-trips exactly. Summaries carrying the old format are treated as "no recorded
+  hashes" (never guessed stale) and surfaced in the ingest report's errors — a re-distill
+  rewrites the map in the new format.
+
 ## [0.2.0] — 2026-08-06 · "the open, secured, movable brain"
 
 The graph learned to say what a node **is**, the reader learned to show media inline, a security
