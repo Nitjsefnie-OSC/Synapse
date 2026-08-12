@@ -524,3 +524,72 @@ class TestDescribe:
         svc.describe("repo_photos__album__sunset.png.asset.md", photos / "album" / "sunset.png")
         after = svc.undescribed_assets()
         assert "repo_photos__album__sunset.png.asset.md" not in after
+
+    SIDECAR_KEYS = {"synapse.source_repo", "synapse.source_path", "synapse.kind",
+                    "synapse.asset_type", "synapse.asset_stat", "synapse.content_hash",
+                    "synapse.ingested_at", "synapse.file_mtime", "synapse.first_seen",
+                    "synapse.inferred_links"}
+    # the same hostile payloads as the summary-side battery (TestStaleness.HOSTILE_FNAMES),
+    # re-suffixed as images, PLUS the two names aimed at the _write_back insertion anchor:
+    # the anchor string carried INSIDE a quoted source_path value (delta-3 Finding 1), and
+    # a name that forges the anchor key outright
+    HOSTILE_ASSETS = [
+        *(n[:-3] + ".png" for n in TestStaleness.HOSTILE_FNAMES),
+        "pic synapse.ingested_at: 1999-01-01T00:00:00Z.png",
+        "x\nsynapse.ingested_at: 1999-01-01T00:00:00Z\ny.png",
+    ]
+
+    def test_hostile_asset_names_cannot_forge_sidecar_frontmatter(self, tmp_path):
+        """Fourth site of the injection class, closed: _write_back inserts the
+        inferred_links line into an EXISTING sidecar, so its insertion anchor must be the
+        LINE-ANCHORED key — a raw substring search matches INSIDE the fm_quote'd
+        source_path value of a hostile asset name (one physical line that still CONTAINS
+        the anchor text) and splices the new line into the middle of that value: the real
+        `synapse.inferred_links` key never exists line-anchored (the graph reads no
+        INFERRED edges and the next carry-over rewrite drops the paid links), and the
+        attacker tail becomes a forged line-anchored key. For every hostile name the
+        post-describe frontmatter must yaml-parse to EXACTLY the sidecar key set, decode
+        source_path back to the exact name, carry the links line line-anchored exactly
+        once, and keep all of that through a re-ingest carry-over rewrite."""
+        import yaml
+        from modules.ingest.src.services import fm_unquote
+        key_line = re.compile(r"^synapse\.[a-z_]+: ")
+        links_re = re.compile(r"^synapse\.inferred_links: (.*)$", re.MULTILINE)
+        ingested_re = re.compile(r"^synapse\.ingested_at: ", re.MULTILINE)
+        for i, fname in enumerate(self.HOSTILE_ASSETS):
+            case = tmp_path / f"case{i}"
+            repo = case / "repo"
+            repo.mkdir(parents=True)
+            (repo / "target.md").write_text("# Target\n\nsome body\n", encoding="utf-8")
+            (repo / fname).write_bytes(b"\x89PNG\r\n\x1a\n fake")
+            v = case / "vault"
+            ing = IngestService(v, IGNORE)
+            rep = ing.ingest([repo], asset_roots={str(repo.resolve())})
+            note_id = f"repo__{fname}.asset.md"
+            sidecar = v / "notes" / note_id
+            assert sidecar.is_file(), f"{fname!r}: {rep.errors}"
+            out = self._svc(v).describe(note_id, repo / fname)
+            assert out["links_added"], fname      # the write-back path was exercised
+            fm = IngestService._frontmatter_text(sidecar)
+            # every physical line is a synapse key line — the name forged none of its own
+            assert all(key_line.match(ln) for ln in fm.splitlines()), fname
+            # …and the fm parses to EXACTLY the intended keys — no forged key (the
+            # attacker tail must not become a second `synapse.ingested_at`), and the
+            # links key must be a REAL key, not text spliced into another value
+            vals = yaml.safe_load(fm)
+            assert set(vals) == self.SIDECAR_KEYS, fname
+            assert vals["synapse.source_path"] == fname, fname
+            assert vals["synapse.kind"] == "asset", fname
+            # the links line landed line-anchored, exactly once, decoding to the exact
+            # ids the describer returned; the ingested_at anchor stayed unique
+            assert len(links_re.findall(fm)) == 1, fname
+            assert len(ingested_re.findall(fm)) == 1, fname
+            got = fm_unquote(links_re.search(fm).group(1)).split(" | ")
+            assert got == out["links_added"], fname
+            # a re-ingest (asset changed) carries the links over: still exactly one
+            # line-anchored links key, still the exact key set
+            (repo / fname).write_bytes(b"\x89PNG\r\n\x1a\n changed")
+            ing.ingest([repo], asset_roots={str(repo.resolve())})
+            fm2 = IngestService._frontmatter_text(sidecar)
+            assert set(yaml.safe_load(fm2)) == self.SIDECAR_KEYS, fname
+            assert len(links_re.findall(fm2)) == 1, fname

@@ -240,6 +240,12 @@ class DistillService:
 
 _AI_SECTION = "## Description (AI)"
 _LINKS_LINE_RE = re.compile(r"^synapse\.inferred_links: .*\n", re.MULTILINE)
+# insertion anchor for the links line: the LINE-ANCHORED real key, never a substring —
+# a hostile asset filename carries the literal "synapse.ingested_at:" INSIDE its
+# fm_quote'd source_path value (one physical line that still CONTAINS the anchor text),
+# and a substring match splices the new line into the middle of that value (issue #9,
+# fourth site of the frontmatter-injection class)
+_INGESTED_AT_LINE_RE = re.compile(r"^synapse\.ingested_at: ", re.MULTILINE)
 
 
 class DescribeService:
@@ -314,9 +320,9 @@ class DescribeService:
             # fm_quote the joined line: link ids are graph note ids, which embed raw
             # filenames — a newline in one would otherwise forge frontmatter here too
             line = f"synapse.inferred_links: {fm_quote(' | '.join(links))}\n"
-            if "synapse.ingested_at:" in content:
-                content = content.replace("synapse.ingested_at:",
-                                          line + "synapse.ingested_at:", 1)
+            anchor = _INGESTED_AT_LINE_RE.search(content)
+            if anchor:
+                content = content[:anchor.start()] + line + content[anchor.start():]
             elif content.startswith("---\n"):   # hand-authored sidecar (Obsidian edits)
                 content = "---\n" + line + content[4:]
             else:

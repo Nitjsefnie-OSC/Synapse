@@ -83,6 +83,11 @@ def parse_source_hashes(line: str) -> dict[str, str] | None:
 # double-quoted string, the same escaping doctrine as the hash map: JSON escapes every
 # byte a filesystem permits, so the value can never break the line's framing. Readers
 # decode with fm_unquote; bare legacy values pass through unchanged.
+# The class has an ANCHOR side too: an insertion/strip point located by a synapse.*
+# SUBSTRING matches inside a quoted value (one physical line that still CONTAINS the
+# anchor text) — anchors must be line-anchored regexes (see _write_stale_flag below,
+# DescribeService._write_back). backend/tests/test_frontmatter_guard.py statically
+# fails any new emission not routed through fm_quote and any new substring anchor.
 _YAML_BREAKS_RE = re.compile(
     # control chars, DEL, and the three UNICODE line breaks YAML 1.1 honours (NEL, LS, PS)
     # — json.dumps(ensure_ascii=False) emits the unicode ones RAW, so they must force
