@@ -18,6 +18,11 @@ from pathlib import Path
 
 from .models import Edge, Graph, Node
 
+# frontmatter VALUES may be fm_quote'd at write time (issue #9, third round — a filename
+# with a newline otherwise forges frontmatter lines); every field read decodes back to
+# the exact original string here, so the rest of the graph never sees the quoting
+from modules.ingest.src.services import fm_unquote
+
 _FM_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 _FM_FIELD_RE = re.compile(
     r"^synapse\.(source_repo|source_path|kind|asset_type|inferred_links|asset_refs"
@@ -59,7 +64,8 @@ class GraphService:
             except FileNotFoundError:
                 continue   # pruned/deleted between glob and read (racing tab) — not an error
             fm = _FM_RE.match(text)
-            fields = dict(_FM_FIELD_RE.findall(fm.group(1))) if fm else {}
+            fields = ({k: fm_unquote(v) for k, v in _FM_FIELD_RE.findall(fm.group(1))}
+                      if fm else {})
             body = text[fm.end():] if fm else text
             title_m = _TITLE_RE.search(body)
             notes.append({
@@ -227,7 +233,8 @@ class GraphService:
         except FileNotFoundError:
             return None   # deleted between check and read (racing tab)
         fm = _FM_RE.match(text)
-        fields = dict(_FM_FIELD_RE.findall(fm.group(1))) if fm else {}
+        fields = ({k: fm_unquote(v) for k, v in _FM_FIELD_RE.findall(fm.group(1))}
+                  if fm else {})
         return {
             "id": note_id,
             "repo": fields.get("source_repo", ""),

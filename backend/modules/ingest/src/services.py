@@ -54,7 +54,7 @@ def encode_source_hashes(hashes: dict[str, str]) -> str:
     off keeps Hebrew/emoji ids readable — JSON never emits raw control characters, so the
     line stays single-line (and YAML-frontmatter-safe) for ANY id. Key order is the distill
     citation order, so an unchanged source set re-encodes byte-identically."""
-    return json.dumps(hashes, ensure_ascii=False)
+    return _json_line(hashes)
 
 
 def parse_source_hashes(line: str) -> dict[str, str] | None:
@@ -71,6 +71,73 @@ def parse_source_hashes(line: str) -> dict[str, str] | None:
     if not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
         return None
     return data
+
+
+# Issue #9, third round — frontmatter injection is a CLASS, not two lines. Note ids, root
+# ids, repo names and paths all embed RAW filenames, and a legal filename may contain a
+# newline: `x\nsynapse.stale: true\ny.md` interpolated bare into ANY frontmatter line
+# forges real frontmatter (a stale flag on an unchanged source; a shadow source_hashes map
+# that wins the first-match regex). The class is closed at EMISSION: every hostile-capable
+# scalar goes through fm_quote — bare when the value is already a safe YAML plain scalar
+# (the common case; frontmatter is for humans, so readable stays readable), else a JSON
+# double-quoted string, the same escaping doctrine as the hash map: JSON escapes every
+# byte a filesystem permits, so the value can never break the line's framing. Readers
+# decode with fm_unquote; bare legacy values pass through unchanged.
+_YAML_BREAKS_RE = re.compile(
+    # control chars, DEL, and the three UNICODE line breaks YAML 1.1 honours (NEL, LS, PS)
+    # — json.dumps(ensure_ascii=False) emits the unicode ones RAW, so they must force
+    # quoting here AND be escaped inside the quoted form (see _json_line)
+    r"[\x00-\x1f\x7f\x85\u2028\u2029]")
+# a plain scalar starting with one of these is a YAML indicator, never data
+_LEADING_INDICATORS = frozenset("-?:,[]{}#&*!|>'\"%@`")
+_YAML_KEYWORD_RE = re.compile(r"\A(?:~|null|true|false|yes|no|on|off)\Z", re.IGNORECASE)
+_YAML_NUMBER_RE = re.compile(
+    r"\A(?:[-+]?(?:\d[\d_]*(?:\.\d[\d_]*)?|\.\d+)(?:[eE][-+]?\d+)?"
+    r"|[-+]?\.(?:inf|nan)|0[xX][0-9a-fA-F]+|0[oO][0-7]+)\Z", re.IGNORECASE)
+_YAML_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")   # a bare DATE re-types as a timestamp
+
+
+def _json_line(payload) -> str:
+    """json.dumps on ONE line, plus escaping the three unicode line breaks YAML 1.1 treats
+    as real breaks (NEL, LS, PS) — json emits those RAW with ensure_ascii=False, and a raw
+    one would split the line for a YAML reader. Everything else stays readable."""
+    return (json.dumps(payload, ensure_ascii=False)
+            .replace("\x85", "\\u0085").replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029"))
+
+
+def fm_quote(value: str) -> str:
+    """One frontmatter VALUE, safe for ANY string. Bare when the value is already a YAML
+    plain scalar that re-reads as exactly itself (no control/unicode-line-break chars, no
+    leading indicator, no `: ` / ` #` / trailing `:`, and not a word YAML would re-type —
+    `true`, `123`, `2024-01-01`); else a JSON double-quoted string. Either way the result
+    is ONE physical line that decodes back to the exact original with fm_unquote."""
+    if (value
+            and value == value.strip()
+            and not _YAML_BREAKS_RE.search(value)
+            and value[0] not in _LEADING_INDICATORS
+            and ": " not in value and not value.endswith(":")
+            and " #" not in value
+            and not _YAML_KEYWORD_RE.fullmatch(value)
+            and not _YAML_NUMBER_RE.fullmatch(value)
+            and not _YAML_DATE_RE.fullmatch(value)):
+        return value
+    return _json_line(value)
+
+
+def fm_unquote(text: str) -> str:
+    """Inverse of fm_quote on a READ: a JSON-quoted value decodes back to the exact
+    original string; anything else — every pre-fix note, every safe value — passes
+    through unchanged. A quote-shaped value that does not parse as one JSON string is
+    returned raw, never guessed."""
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            return text
+        if isinstance(decoded, str):
+            return decoded
+    return text
 
 
 def is_vault_dir(path: Path) -> bool:
@@ -103,7 +170,10 @@ def note_repo(note_path: Path) -> str | None:
     except FileNotFoundError:
         return None   # deleted between glob and read (racing tab) — nothing to prune
     m = _REPO_RE.search(head)
-    return m.group(1) if m else None
+    # fm_unquote: a repo named with a newline/indicator is written quoted (fm_quote) —
+    # the prune key must be the DECODED real name or the note is pruned from under an
+    # unchanged, managed repo
+    return fm_unquote(m.group(1)) if m else None
 
 
 class IngestService:
@@ -265,8 +335,13 @@ class IngestService:
         asset_first_seen = _prior_fs.group(1) if _prior_fs else ("" if existing else now)
         content = (
             "---\n"
-            f"synapse.source_repo: {asset.repo_name}\n"
-            f"synapse.source_path: {asset.rel_path}\n"
+            # fm_quote on the two filename-derived values (repo name, rel path): a legal
+            # filename may contain a newline or a YAML indicator, and a bare interpolation
+            # forges frontmatter lines. Safe values stay bare and readable; the other
+            # fields are self-generated fixed-alphabet tokens (kind/asset_type literals,
+            # mtime_ns:size, hex digest, ISO timestamps) that can never be hostile.
+            f"synapse.source_repo: {fm_quote(asset.repo_name)}\n"
+            f"synapse.source_path: {fm_quote(asset.rel_path)}\n"
             f"synapse.kind: asset\n"
             f"synapse.asset_type: {asset.asset_type}\n"
             f"synapse.asset_stat: {stat_token}\n"
@@ -346,14 +421,19 @@ class IngestService:
             file_mtime = ""          # unreadable stat is not fatal — the note still indexes
         return (
             "---\n"
-            f"synapse.source_repo: {src.repo_name}\n"
-            f"synapse.source_path: {src.rel_path}\n"
+            # fm_quote on the filename-derived values (repo name, rel path) and on the
+            # asset_refs line (its refs embed media-dir FILENAMES): a legal filename may
+            # contain a newline or a YAML indicator, and a bare interpolation forges
+            # frontmatter lines. Safe values stay bare and readable; the timestamps and
+            # the hex digest are self-generated fixed-alphabet tokens, never hostile.
+            f"synapse.source_repo: {fm_quote(src.repo_name)}\n"
+            f"synapse.source_path: {fm_quote(src.rel_path)}\n"
             f"synapse.ingested_at: {now}\n"
             + (f"synapse.first_seen: {first_seen if first_seen else now}\n"
                if first_seen != "" else "")
             + (f"synapse.file_mtime: {file_mtime}\n" if file_mtime else "")
             + f"synapse.content_hash: {digest}\n"
-            + (f"synapse.asset_refs: {asset_refs}\n" if asset_refs else "")
+            + (f"synapse.asset_refs: {fm_quote(asset_refs)}\n" if asset_refs else "")
             + "---\n"
         )
 
@@ -456,7 +536,9 @@ class IngestService:
         if not note_path.is_file():
             return ""
         m = _REFS_RE.search(self._frontmatter_text(note_path))
-        return m.group(1).strip() if m else ""
+        # fm_unquote undoes fm_quote at write time, so the freshness comparison below is
+        # raw-vs-raw — a quoted (hostile) refs line still converges to "unchanged"
+        return fm_unquote(m.group(1).strip()) if m else ""
 
     def existing_first_seen(self, note_path: Path) -> str | None:
         """The `first_seen` already on disk, so a rewrite never resets it.
@@ -581,16 +663,21 @@ class IngestService:
         distill-time hash map are user artifacts and stay byte-identical."""
         try:
             text = note_path.read_text(encoding="utf-8", errors="replace")
+            # clear EVERY flag line first, not one-per-sync (the old count=1): with
+            # fm_quote at emission no NEW forged `synapse.stale: true` line can be
+            # written, but a legacy/hand-forged summary may carry several, and a scrub
+            # that removes one line per pass never converges on them
+            stripped = _STALE_LINE_RE.sub("", text)
             if stale:
                 # group(0) stops BEFORE the line's "\n" (it backtracks off `\s*$`), so the
                 # newline is re-added here — gluing the flag onto the anchor line would
                 # corrupt BOTH frontmatter fields
                 new = _SUMMARY_KIND_RE.sub(lambda m: m.group(0) + "\nsynapse.stale: true",
-                                           text, count=1)
-                if new == text:
+                                           stripped, count=1)
+                if new == stripped:
                     return   # no anchor line — never invent frontmatter on a foreign note
             else:
-                new = _STALE_LINE_RE.sub("", text, count=1)
+                new = stripped
             tmp = note_path.parent / f"{note_path.name}.{os.getpid()}.tmp"
             tmp.write_text(new, encoding="utf-8")
             os.replace(tmp, note_path)

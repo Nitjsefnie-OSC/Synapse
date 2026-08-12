@@ -1,12 +1,13 @@
 """Epic D unit tests — ALL on MockSummarizer (zero network, zero paid calls)."""
 
+import re
 from pathlib import Path
 
 import pytest
 
 from modules.distill.src.providers import GroundedSummary, MockSummarizer, Summarizer
 from modules.distill.src.service import ConfirmationRequired, DistillService, GroundingError
-from modules.ingest.src.services import IngestService
+from modules.ingest.src.services import IngestService, _STALE_LINE_RE
 
 FIXTURES = Path(__file__).resolve().parents[4] / "tests" / "fixtures"
 IGNORE = frozenset({"node_modules", ".venv", ".git", "__pycache__"})
@@ -327,6 +328,80 @@ class TestStaleness:
                            encoding="utf-8")
             ing.ingest([repo])
             assert "synapse.stale: true" in self._fm(summary), fname   # genuinely tracked
+
+    SUMMARY_KEYS = {"synapse.kind", "synapse.source_repo", "synapse.source_path",
+                    "synapse.ingested_at", "synapse.model", "synapse.scope",
+                    "synapse.sources", "synapse.source_hashes",
+                    "synapse.distilled_from", "synapse.distill_scope",
+                    "synapse.distill_depth"}
+    HOSTILE_FNAMES = [
+        "plain.md",                               # control
+        "x\nsynapse.stale: true\ny.md",           # delta N1 — forged stale flag
+        'z\nsynapse.source_hashes: {"nonexistent.md": "' + "a" * 64 + '"}\nz.md',
+                                                 # delta N2 — forged SHADOW map (wins first-match)
+        "colon: value.md",                        # ': ' mapping indicator
+        "hash # comment.md",                      # ' #' comment indicator
+        "- leading dash.md",                      # block-sequence indicator
+        'quo"te\'s.md',                           # both quote kinds
+        "back\\slash.md",                         # a backslash
+        "synapse.stale: true.md",                 # a name that IS a YAML key line
+        "קורות חיים.md",                          # unicode
+        "line\u2028sep.md",                       # unicode line separator
+        "para\u2029sep.md",                       # unicode paragraph separator
+    ]
+
+    def test_hostile_ids_cannot_forge_summary_frontmatter(self, tmp_path):
+        """Third-round fix — the frontmatter-INJECTION class, closed at EMISSION: every
+        hostile-capable value (note id, root id, path, repo name) is written through
+        fm_quote, so NO filename can forge a frontmatter line anywhere — not the stale
+        flag (delta N1), not a shadow source_hashes map (N2). For each hostile id the
+        written frontmatter must yaml-parse to EXACTLY the intended key set (no forged
+        key appears), decode back to the exact id, never false-stale an unchanged
+        source, still stale on a real edit, and the re-distill escape hatch must clear
+        it (N2 crashed it with a KeyError on the truncated id)."""
+        import yaml
+        key_line = re.compile(r"^synapse\.[a-z_]+: ")
+        for i, fname in enumerate(self.HOSTILE_FNAMES):
+            case = tmp_path / f"case{i}"
+            repo = case / "repo"
+            repo.mkdir(parents=True)
+            (repo / fname).write_text("# probe\n\nthe body\n", encoding="utf-8")
+            v = case / "vault"
+            ing = IngestService(v, IGNORE)
+            ing.ingest([repo])
+            note_id = f"repo__{fname}"
+            # the INGEST note's own frontmatter is emission too (source_path holds the
+            # raw filename) — same audit: exact keys, exact decode, no forged lines
+            note_vals = yaml.safe_load(IngestService._frontmatter_text(v / "notes" / note_id))
+            assert note_vals["synapse.source_path"] == fname, fname
+            assert note_vals["synapse.source_repo"] == "repo", fname
+            assert all(k.startswith("synapse.") for k in note_vals), fname
+            # the summary's frontmatter: every physical line is a synapse key line…
+            svc = DistillService(v, MockSummarizer())
+            out = svc.distill(note_id, scope="node")
+            summary = v / "notes" / out["summary_note_id"]
+            fm = self._fm(summary)
+            assert all(key_line.match(ln) for ln in fm.splitlines()), fname
+            # …and it parses to EXACTLY the intended keys and values — no forged
+            # `synapse.stale`, no shadow `synapse.source_hashes`, no extra key at all
+            vals = yaml.safe_load(fm)
+            assert set(vals) == self.SUMMARY_KEYS, fname
+            assert vals["synapse.distilled_from"] == note_id, fname
+            assert vals["synapse.sources"] == note_id, fname
+            assert vals["synapse.source_hashes"] == {
+                note_id: IngestService.existing_hash(v / "notes" / note_id)}, fname
+            ing.ingest([repo])                                   # nothing changed…
+            # line-exact staleness checks — the hostile ids CONTAIN the substring
+            # "synapse.stale" (inside a quoted value), so a substring test is meaningless;
+            # _STALE_LINE_RE is the same line-anchored regex the sync itself uses
+            assert _STALE_LINE_RE.search(self._fm(summary)) is None, fname  # …nothing stales
+            src = repo / fname
+            src.write_text(src.read_text(encoding="utf-8") + "\nthe ripple edit\n",
+                           encoding="utf-8")
+            ing.ingest([repo])
+            assert _STALE_LINE_RE.search(self._fm(summary)) is not None, fname  # tracked
+            svc.redistill(out["summary_note_id"])    # the escape hatch N2 killed…
+            assert _STALE_LINE_RE.search(self._fm(summary)) is None, fname  # …must clear it
 
     def test_one_click_redistill_uses_the_recorded_root_and_clears_stale(self, editable_vault):
         """The UI's one-click re-distill: from the summary note ALONE (its recorded root /

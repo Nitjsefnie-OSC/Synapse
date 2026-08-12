@@ -15,7 +15,7 @@ from pathlib import Path
 
 from modules.graph.src.services import GraphService
 from modules.ingest.src.models import cap_note_id
-from modules.ingest.src.services import IngestService, encode_source_hashes
+from modules.ingest.src.services import IngestService, encode_source_hashes, fm_quote, fm_unquote
 
 from .providers import SourceNote, Summarizer
 
@@ -23,7 +23,7 @@ _CITE_RE = re.compile(r"\(vault:\s*([^)]+?)\s*\)")
 SUMMARY_REPO = "✦ summaries"
 # issue #9 — the one-click re-distill reads the summary's own provenance lines
 _DISTILLED_FROM_RE = re.compile(r"^synapse\.distilled_from:\s*(.+?)\s*$", re.MULTILINE)
-_DISTILL_SCOPE_RE = re.compile(r"^synapse\.distill_scope:\s*(\S+)\s*$", re.MULTILINE)
+_DISTILL_SCOPE_RE = re.compile(r"^synapse\.distill_scope:\s*(.+?)\s*$", re.MULTILINE)
 _DISTILL_DEPTH_RE = re.compile(r"^synapse\.distill_depth:\s*(\d+)\s*$", re.MULTILINE)
 
 
@@ -176,8 +176,11 @@ class DistillService:
                 f"'{summary_note_id}' predates distill provenance (no synapse.distilled_from) "
                 "— re-distill it from its root note instead.")
         scope_m, depth_m = _DISTILL_SCOPE_RE.search(fm), _DISTILL_DEPTH_RE.search(fm)
-        return self.distill(m.group(1),
-                            scope=scope_m.group(1) if scope_m else "node",
+        # fm_unquote undoes the fm_quote at write time: a root id or scope that needed
+        # quoting (a newline filename rides every note id) decodes back to the EXACT
+        # vault id — a truncated read is the KeyError the delta probe killed redistill with
+        return self.distill(fm_unquote(m.group(1)),
+                            scope=fm_unquote(scope_m.group(1)) if scope_m else "node",
                             depth=int(depth_m.group(1)) if depth_m else 2,
                             confirm=confirm)
 
@@ -196,20 +199,29 @@ class DistillService:
         hash_map = encode_source_hashes({
             n.note_id: h for n in notes
             if (h := IngestService.existing_hash(self.vault_path / "notes" / n.note_id))})
+        # issue #9, third round — EVERY hostile-capable scalar goes through fm_quote
+        # (note ids / root id embed raw filenames; a legal filename may contain a
+        # newline, and a bare interpolation forges real frontmatter lines: the delta
+        # probe marked an unchanged source stale via `synapse.sources` and crashed
+        # redistill via a shadow `synapse.source_hashes`). Safe values stay bare and
+        # human-readable; hostile ones become one JSON-quoted line. `source_repo` is a
+        # compile-time literal, ingested_at an ISO timestamp, distill_depth an int —
+        # fixed alphabets, never hostile.
+        scope_line = f"{scope} (depth {depth if scope == 'subtree' else '-'})"
         fm = (
             "---\n"
             "synapse.kind: summary\n"
             f"synapse.source_repo: {SUMMARY_REPO}\n"
-            f"synapse.source_path: {note_id}\n"
+            f"synapse.source_path: {fm_quote(note_id)}\n"
             f"synapse.ingested_at: {now}\n"
-            f"synapse.model: {result.model}\n"
-            f"synapse.scope: {scope} (depth {depth if scope == 'subtree' else '-'})\n"
-            f"synapse.sources: {', '.join(n.note_id for n in notes)}\n"
+            f"synapse.model: {fm_quote(result.model)}\n"
+            f"synapse.scope: {fm_quote(scope_line)}\n"
+            f"synapse.sources: {fm_quote(', '.join(n.note_id for n in notes))}\n"
             f"synapse.source_hashes: {hash_map}\n"
             # machine-readable provenance for the one-click re-distill (`synapse.scope`
             # above stays the human line — it predates this feature and is display-shaped)
-            f"synapse.distilled_from: {root_id}\n"
-            f"synapse.distill_scope: {scope}\n"
+            f"synapse.distilled_from: {fm_quote(root_id)}\n"
+            f"synapse.distill_scope: {fm_quote(scope)}\n"
             f"synapse.distill_depth: {depth}\n"
             "---\n"
         )
@@ -299,7 +311,9 @@ class DescribeService:
         content = path.read_text(encoding="utf-8")
         content = _LINKS_LINE_RE.sub("", content)
         if links:
-            line = f"synapse.inferred_links: {' | '.join(links)}\n"
+            # fm_quote the joined line: link ids are graph note ids, which embed raw
+            # filenames — a newline in one would otherwise forge frontmatter here too
+            line = f"synapse.inferred_links: {fm_quote(' | '.join(links))}\n"
             if "synapse.ingested_at:" in content:
                 content = content.replace("synapse.ingested_at:",
                                           line + "synapse.ingested_at:", 1)

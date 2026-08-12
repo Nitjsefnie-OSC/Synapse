@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from modules.ingest.src.services import IngestService, encode_source_hashes, parse_source_hashes
+from modules.ingest.src.services import (
+    IngestService, encode_source_hashes, fm_quote, fm_unquote, parse_source_hashes)
 
 FIXTURES = Path(__file__).resolve().parents[4] / "tests" / "fixtures"
 REPO_A = FIXTURES / "repo_a"
@@ -233,3 +234,86 @@ class TestSourceHashesCodec:
         report = service.ingest([REPO_A])
         assert any("source_hashes" in e and summary.name in e for e in report.errors)
         assert "synapse.stale" not in summary.read_text(encoding="utf-8")
+
+
+class TestFrontmatterEscaping:
+    """Issue #9, third round — note ids, repo names and paths all embed RAW filenames, and
+    a legal filename may contain a newline: interpolated bare into a frontmatter line it
+    FORGES real frontmatter lines (`x\\nsynapse.stale: true\\ny.md` marks an unchanged
+    source stale; a shadow `synapse.source_hashes` line wins the first-match regex). The
+    whole class is closed at EMISSION: every hostile-capable scalar goes through fm_quote
+    (bare when already a safe YAML plain scalar, else a JSON double-quoted string), and
+    every reader decodes with fm_unquote."""
+
+    # newline, `: `, ` #`, leading `-`, both quote kinds, backslash, a name that IS a
+    # YAML key line, unicode, unicode line/paragraph separators, YAML-re-typed words —
+    # plus the plain control
+    ADVERSARIAL_SCALARS = [
+        "plain.md",
+        "x\nsynapse.stale: true\ny.md",
+        'z\nsynapse.source_hashes: {"nonexistent.md": "' + "a" * 64 + '"}\nz.md',
+        "colon: value.md",
+        "hash # comment.md",
+        "- leading dash.md",
+        'quo"te\'s.md',
+        "back\\slash.md",
+        "synapse.stale: true.md",
+        "קורות חיים.md",
+        "line\u2028sep.md",
+        "para\u2029sep.md",
+        "trailing colon:.md",
+        " leading space.md",
+        "true", "null", "123", "2024-01-01", "",
+    ]
+
+    def test_fm_quote_roundtrips_any_scalar_through_real_yaml(self):
+        """Property: for ANY string, fm_quote output is ONE physical line, fm_unquote
+        inverts it exactly, AND a real YAML parser reads the line back as the exact
+        original string — never a re-typed bool/date/int, never a forged mapping."""
+        import yaml
+        for v in self.ADVERSARIAL_SCALARS:
+            enc = fm_quote(v)
+            assert "\n" not in enc and "\r" not in enc, v
+            assert fm_unquote(enc) == v, v
+            assert yaml.safe_load(f"synapse.probe: {enc}")["synapse.probe"] == v, v
+
+    def test_safe_scalars_stay_bare_and_readable(self):
+        """The common case must not change shape: frontmatter is for humans. Repo names,
+        paths, ids and the ✦ summaries literal all stay unquoted."""
+        for v in ("repo_a", "docs/alpha.md", "✦ summaries", "S — probe.md",
+                  "repo__Meeting | notes.md", "image", "2026-08-04T10:00:00+00:00"):
+            assert fm_quote(v) == v, v
+
+    def test_hostile_repo_name_decodes_for_the_prune_key(self, service, tmp_path):
+        """A repo dir named with a newline forges frontmatter exactly like a hostile
+        filename — and a repo name read back TRUNCATED (`ev` instead of the real name)
+        prunes the note out from under an unchanged, managed repo. note_repo must decode
+        the quoted value."""
+        import yaml
+        name = "ev\nsynapse.kind: summary\nil"
+        repo = tmp_path / name
+        repo.mkdir()
+        (repo / "a.md").write_text("# A\n", encoding="utf-8")
+        service.ingest([repo], managed_names={name})
+        note = service.notes_dir / f"{name}__a.md"
+        assert note.is_file()                       # NOT pruned — decoded name matched
+        vals = yaml.safe_load(IngestService._frontmatter_text(note))
+        assert set(vals) == {"synapse.source_repo", "synapse.source_path",
+                             "synapse.ingested_at", "synapse.first_seen",
+                             "synapse.file_mtime", "synapse.content_hash"}
+        assert vals["synapse.source_repo"] == name  # exact, newline and all
+        again = service.ingest([repo], managed_names={name})
+        assert note.is_file() and again.pruned == 0  # idempotent, still managed
+
+    def test_stale_scrub_clears_every_forged_flag_line(self, service):
+        """The scrub removed only ONE `synapse.stale: true` line per sync (count=1) — a
+        multi-line injection (delta N1 forged several) could never converge. Clearing
+        must remove them ALL in one pass. (With fm_quote at emission no NEW forged line
+        can be written; this is the legacy/hand-forged mop-up.)"""
+        service.notes_dir.mkdir(parents=True, exist_ok=True)
+        summary = service.notes_dir / "S — forged.md"
+        summary.write_text("---\nsynapse.kind: summary\n"
+                           + "synapse.stale: true\n" * 4
+                           + "synapse.source_hashes: {}\n---\nbody\n", encoding="utf-8")
+        service.refresh_summary_staleness(errors=[])
+        assert "synapse.stale" not in IngestService._frontmatter_text(summary)
