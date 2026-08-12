@@ -40,7 +40,13 @@ _FM_KEY_RE = re.compile(r"^synapse\.[a-z_]+:", re.MULTILINE)
 _SUMMARY_KIND_RE = re.compile(r"^synapse\.kind:\s*summary\s*$", re.MULTILINE)
 _SOURCE_HASHES_RE = re.compile(r"^synapse\.source_hashes:\s*(.*?)\s*$", re.MULTILINE)
 _STALE_LINE_RE = re.compile(r"^synapse\.stale: true\n", re.MULTILINE)
-_HASH_PAIR_RE = re.compile(r"\A(.+)=([0-9a-f]{64})\Z")
+# One `<note_id>=<sha256>` pair, matched at a position and anchored on the hash: the id is
+# everything up to the FIRST `=<64 hex>` followed by the ` | ` separator or end-of-line.
+# The anchor is what makes a note id containing " | " (a legal filename — "Meeting |
+# notes.md" → `repo__Meeting | notes.md`) parse unambiguously: splitting the line on the
+# separator would yield a bogus `notes.md=<hash>` token that resolves to a nonexistent
+# note and marks the summary stale FOREVER (a re-distill rewrites the same map).
+_HASH_PAIR_RE = re.compile(r"(.+?)=([0-9a-f]{64})(?: \| |\Z)")
 FRONTMATTER_END = "---"
 
 
@@ -520,11 +526,17 @@ class IngestService:
             m = _SOURCE_HASHES_RE.search(fm)
             if not m or not m.group(1):
                 continue   # pre-#9 summary — honest absence
+            # NEVER split the line on " | " — a note id can contain the separator verbatim
+            # (see _HASH_PAIR_RE). Walk it left to right, one anchored pair at a time.
             stale = False
-            for token in m.group(1).split(" | "):
-                pair = _HASH_PAIR_RE.match(token.strip())
-                if not pair or Path(pair.group(1)).name != pair.group(1):
-                    continue   # malformed/hand-edited token — not evidence either way
+            pos, line = 0, m.group(1)
+            while pos < len(line):
+                pair = _HASH_PAIR_RE.match(line, pos)
+                if not pair:
+                    break   # malformed/hand-edited residue — not evidence either way
+                pos = pair.end()
+                if Path(pair.group(1)).name != pair.group(1):
+                    continue   # an id is a bare filename, never a path
                 if self.existing_hash(self.notes_dir / pair.group(1)) != pair.group(2):
                     stale = True
                     break

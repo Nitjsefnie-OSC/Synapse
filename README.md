@@ -199,8 +199,11 @@ patterns.) Notes under a newly-ignored path are pruned on the next sync, with ho
 - **▣ Render** — the distill authors its own visual brief; the image model turns it into a
   picture (no text in images, by rule) stored under `data/vault/media/` and embedded beside
   the summary.
-- **✦ My distills** — panel listing all your summaries: read, or bulk-delete (removes the note
-  + its image; sources are never touched).
+- **✦ My distills** — panel listing all your summaries: read, re-distill, or bulk-delete
+  (removes the note + its image; sources are never touched). A summary whose cited sources
+  changed since the distill wears a ⚠ stale badge (here and on its canvas node); ↻
+  re-distill (`POST /api/v1/redistill`) refreshes it from the current sources and clears
+  the flag.
 
 | The AI loop: a distilled note + its self-briefed image | The wiki reader over the full graph |
 |---|---|

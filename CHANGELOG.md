@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Ripple maintenance for distills** (issue #9) — a distilled `S —` summary records each
+  cited source's content hash (`synapse.source_hashes`); every ingest re-compares them
+  against the vault and flags drift with `synapse.stale: true`, surfaced as a ⚠ stale
+  badge in the ✦ My distills panel and on the canvas node, and as a ripple line in the
+  ingest report. It is a comparison, not a latch — reverting the source clears the flag —
+  and **↻ re-distill** (the panel button, or `POST /api/v1/redistill`) re-runs the recorded
+  distill from the summary's own provenance frontmatter, clearing the flag and
+  re-recording the hashes. The same spend gate and grounding audit apply: a re-distill is
+  a distill.
+
 ## [0.2.0] — 2026-08-06 · "the open, secured, movable brain"
 
 The graph learned to say what a node **is**, the reader learned to show media inline, a security

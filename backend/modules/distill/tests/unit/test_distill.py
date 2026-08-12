@@ -263,6 +263,35 @@ class TestStaleness:
         ing.ingest([repo], managed_names={"repo_a"})
         assert "synapse.stale: true" in self._fm(summary)
 
+    def test_pipe_named_source_does_not_corrupt_the_hash_map(self, tmp_path):
+        """Verification-pass P1: a legal `X | Y` filename ("Meeting | notes.md") puts the
+        map's " | " separator INSIDE the note id verbatim (`piperepo__Meeting | notes.md`).
+        Splitting the map line on the separator then yields a bogus `notes.md=<hash>` token
+        that resolves to a NONEXISTENT note — the summary is marked stale on every sync,
+        forever (a re-distill rewrites the same malformed map), and every entry after the
+        pipe-named one is poisoned. The line must be parsed pair-by-pair, each pair
+        anchored on its 64-hex hash — never split."""
+        repo = tmp_path / "piperepo"; repo.mkdir()
+        (repo / "Meeting | notes.md").write_text("# Meeting notes\n\nthe body\n",
+                                                 encoding="utf-8")
+        v = tmp_path / "pipevault"
+        ing = IngestService(v, IGNORE)
+        ing.ingest([repo])
+        svc = DistillService(v, MockSummarizer())
+        out = svc.distill("piperepo__Meeting | notes.md", scope="node")
+        summary = v / "notes" / out["summary_note_id"]
+        ing.ingest([repo])                                  # nothing changed…
+        assert "synapse.stale" not in self._fm(summary)     # …so nothing may turn stale
+        # the pipe-named source is genuinely TRACKED, not skipped: a real edit stales it…
+        src = repo / "Meeting | notes.md"
+        src.write_text(src.read_text(encoding="utf-8") + "\nthe ripple edit\n",
+                       encoding="utf-8")
+        ing.ingest([repo])
+        assert "synapse.stale: true" in self._fm(summary)
+        svc.redistill(out["summary_note_id"])   # …and a re-distill must be able to CLEAR it
+        ing.ingest([repo])
+        assert "synapse.stale" not in self._fm(summary)
+
     def test_one_click_redistill_uses_the_recorded_root_and_clears_stale(self, editable_vault):
         """The UI's one-click re-distill: from the summary note ALONE (its recorded root /
         scope / depth), re-run the distill — the fresh write clears the flag."""
