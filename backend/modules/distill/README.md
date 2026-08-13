@@ -11,7 +11,10 @@ sources wikilinked (so the next rebuild adds the summary to the graph, in its ow
 - **Honesty:** zero-citation output ⇒ `GroundingError` (422, run rejected). Size-cap cuts ⇒
   the summary SAYS it was truncated. Cost guard: est. tokens > `SUMMARIZE_CONFIRM_THRESHOLD`
   (default 20k) ⇒ `requires_confirmation` — the UI asks before spending.
-- `POST /api/v1/distill {node_id, scope: node|subtree, depth, confirm}`.
+- `POST /api/v1/distill {node_id, scope: node|subtree, depth, confirm, dry_run}`. `dry_run: true`
+  is a genuinely non-spending path — `{tokens_est, threshold, requires_confirmation, truncated,
+  sources}`, never touches the summarizer (issue #3 fix-loop F1: `confirm: false` alone is NOT
+  free — below the cost guard it still runs the real summarize() call).
 - Live smoke: opt-in, via `./start.sh smoke` (issue #3) — needs real keys, never CI.
 
 Deviation from the epic card (recorded): source-note backlinks are NOT written into source

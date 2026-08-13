@@ -13,6 +13,13 @@
 #   ./start.sh status|stop  # Health check / kill project processes
 #   ./start.sh service install|start|stop|restart|status|logs|uninstall
 #                           # run as an APP: supervised, restarts on crash, survives a closed terminal
+#   ./start.sh smoke        # Opt-in LIVE smoke (issue #3): real Anthropic distill + real
+#                           # gpt-image-1 render. Needs both keys, never runs in CI, shows a
+#                           # non-spending estimate and asks before spending.
+#                           # SYNAPSE_SMOKE_YES=1 bypasses the interactive [y/N] confirm for
+#                           # non-interactive/agent runs that already reviewed the cost.
+#                           # Exit codes: 1 = actionable refusal, 2 = unknown command,
+#                           # 3 = a live provider call failed (see the transcript).
 #   ./start.sh help         # This help + URLs and links
 set -euo pipefail
 
@@ -285,6 +292,7 @@ cmd_help() {
   echo "     ./start.sh production   production server (Docker/CI — no reload)"
   echo "     ./start.sh test         run the test suite"
   echo "     ./start.sh smoke        live-model smoke (real \$: Anthropic distill + gpt-image render) — opt-in, needs keys, never in CI"
+  echo "                              ${C_DIM}(SYNAPSE_SMOKE_YES=1 skips the interactive [y/N] confirm)${C_OFF}"
   echo "     ./start.sh status       ports + health   ·   ./start.sh stop"
   echo "     ./start.sh preflight    check prerequisites only (Python, Node) — offers installs"
   echo ""
@@ -370,10 +378,19 @@ cmd_test() {
 # load-bearing part:
 #   - never runs in CI, no matter what
 #   - refuses without both keys, actionably, exit 1 (never the unknown-command exit 2)
-#   - shows the spend estimate and asks before making a paid call
+#   - refuses against a SYNAPSE_MOCK_MODELS=1 backend (a zero-spend run must never be labeled
+#     a live smoke)
+#   - shows a genuinely non-spending token estimate (POST /distill {dry_run: true} — never
+#     calls the summarizer) and asks before making the ONE paid distill call (never two —
+#     `confirm: false` alone is NOT free: below the server's cost-guard threshold it still
+#     summarizes for real; SYNAPSE_SMOKE_YES=1 bypasses the interactive [y/N] for
+#     non-interactive/agent runs)
 #   - talks to an ALREADY-RUNNING backend (./start.sh dev / service) — it does not manage its
 #     own stack, so it never touches the app lifecycle
-#   - records a transcript under the active sprint's reports/ dir
+#   - records a transcript under the active sprint's reports/ dir (mktemp — collision-proof);
+#     a failed provider call gets a diagnostic, a FAILED section in the transcript with the
+#     safe response context, and a documented exit code (3) — never a bare curl exit status,
+#     and never a second provider call after an earlier failure
 smoke_is_ci() {
   case "${CI:-}" in true | TRUE | True | 1) return 0 ;; esac
   [ -n "${GITHUB_ACTIONS:-}" ] && return 0
@@ -395,24 +412,43 @@ smoke_is_placeholder() {
   return 1
 }
 
+# Whitespace trim via parameter expansion only — NEVER xargs (issue #3 fix-loop F3): xargs
+# applies shell quote/glob semantics to arbitrary file content, so a value like `don't` throws
+# "unmatched single quote" to stderr on every run and gets silently blanked.
+_smoke_trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
 _SMOKE_ENV_LOADED=false
-# Mirrors config.py's _load_dotenv: a real value already in the process env always wins; a
-# placeholder in the process env never blocks the file's real value.
+# Mirrors config.py's _load_dotenv EXACTLY: `line = raw.strip()` happens BEFORE the
+# blank/comment test, so an INDENTED `  # comment` is a comment, never a KEY=VALUE line (F3 —
+# the old `case "$line" in ""|"#"*)` tested the raw, unstripped line and mis-parsed an indented
+# comment as `key="# ..."`, which then blew up bash's `${!key}` and killed the whole command).
+# A real value already in the process env always wins; a placeholder in the process env never
+# blocks the file's real value.
 smoke_load_env_once() {
   $_SMOKE_ENV_LOADED && return 0
   _SMOKE_ENV_LOADED=true
   local f; f="$(smoke_env_file)"
   [ -f "$f" ] || return 0
-  local line key value current
-  while IFS= read -r line || [ -n "$line" ]; do
+  local raw line key value current
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    line="$(_smoke_trim "$raw")"
     case "$line" in ""|"#"*) continue ;; esac
     case "$line" in *=*) : ;; *) continue ;; esac
-    key="${line%%=*}"; value="${line#*=}"
-    key="$(echo "$key" | xargs)"
-    value="$(echo "$value" | xargs)"
+    key="$(_smoke_trim "${line%%=*}")"
+    value="$(_smoke_trim "${line#*=}")"
     value="${value%\"}"; value="${value#\"}"
     value="${value%\'}"; value="${value#\'}"
     [ -z "$key" ] && continue
+    # config.py accepts ANY non-empty string as an os.environ key (it's just a dict); bash
+    # cannot export/expand a non-identifier name (`MY-VAR=1`) — skip it safely rather than
+    # let `${!key}` abort the whole command under `set -e` (F3).
+    case "$key" in [A-Za-z_]*) : ;; *) continue ;; esac
+    case "$key" in *[![:alnum:]_]*) continue ;; esac
     current="${!key:-}"
     if [ -z "$current" ] || smoke_is_placeholder "$current"; then
       export "$key=$value"
@@ -428,7 +464,13 @@ smoke_key_present() {
 
 # Active sprint's reports dir, read from the sprint index graph node (never hardcoded — sprints
 # close and a new one opens). Falls back to the newest sprint dir if the index can't be parsed.
+# SYNAPSE_SMOKE_REPORTS_DIR overrides it (tests must never write a transcript into the tracked
+# project tree — same override discipline as SYNAPSE_ENV_FILE).
 smoke_reports_dir() {
+  if [ -n "${SYNAPSE_SMOKE_REPORTS_DIR:-}" ]; then
+    echo "$SYNAPSE_SMOKE_REPORTS_DIR"
+    return 0
+  fi
   local idx="$SCRIPT_DIR/project-management/sprints/00_index.md" sprint=""
   if [ -f "$idx" ]; then
     sprint="$(grep -m1 -E 'OPEN' "$idx" 2>/dev/null | grep -oE 'sprint_[0-9]+' | head -1 || true)"
@@ -438,6 +480,40 @@ smoke_reports_dir() {
       | sort | tail -1 | xargs -r basename)"
   fi
   echo "$SCRIPT_DIR/project-management/sprints/${sprint:-sprint_06}/reports"
+}
+
+# One safe HTTP JSON POST: captures the status code AND the body (NEVER `-f`, which discards
+# the body on failure — issue #3 fix-loop F4). Sets SMOKE_LAST_STATUS/SMOKE_LAST_BODY; returns
+# 0 for 2xx, 1 otherwise (a connection failure sets status "000", body empty) — it never aborts
+# the script itself, so a provider failure gets a diagnostic + a transcript record instead of a
+# bare, unexplained curl exit status (curl's own -f exit code, e.g. 22, meant nothing to anyone
+# reading it and is not one of this command's own documented exit codes).
+SMOKE_LAST_STATUS=""
+SMOKE_LAST_BODY=""
+smoke_post_json() {
+  local url="$1" data="$2" tmp status
+  tmp="$(mktemp)"
+  status="$(curl -s -o "$tmp" -w '%{http_code}' -X POST "$url" -H 'Content-Type: application/json' -d "$data" 2>/dev/null)" || status="000"
+  SMOKE_LAST_BODY="$(cat "$tmp" 2>/dev/null)"
+  rm -f "$tmp"
+  SMOKE_LAST_STATUS="$status"
+  case "$status" in 2??) return 0 ;; esac
+  return 1
+}
+
+# Appends a FAILED section to the transcript — the safe response context (HTTP status + body,
+# never a secret: these are the PROVIDER'S OWN error responses, not request payloads), so a
+# reader can see exactly what failed without re-running anything. Whatever succeeded ABOVE this
+# section in the transcript stays fully recorded (F4 — no silent truncation).
+smoke_transcript_failure() {
+  local transcript="$1" step="$2" status="$3" body="$4"
+  {
+    echo ""
+    echo "## $step — FAILED (HTTP ${status:-unreachable})"
+    echo '```json'
+    echo "${body:-<no response body — connection failed>}"
+    echo '```'
+  } >>"$transcript"
 }
 
 cmd_smoke() {
@@ -466,11 +542,31 @@ cmd_smoke() {
     exit 1
   fi
 
-  # 4) Spend estimate + explicit confirmation, BEFORE any paid call.
+  # 3b) Refuse a MOCKED backend (L1) — SYNAPSE_MOCK_MODELS=1 would make ZERO real provider
+  # calls yet still print "Live smoke complete" and file a transcript headed with the real
+  # model names, which is indistinguishable from a genuine live run except by reading the JSON
+  # body's "model" field. Best-effort: an older backend without /api/v1/models/status is not
+  # refused here — this is a safety net, not a new hard requirement on the backend.
+  local mock_status; mock_status="$(curl -sf "http://localhost:$PORT/api/v1/models/status" 2>/dev/null || true)"
+  if [ -n "$mock_status" ]; then
+    local is_mock; is_mock="$(echo "$mock_status" \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print('1' if d.get('mock') else '0')" 2>/dev/null || echo 0)"
+    if [ "$is_mock" = "1" ]; then
+      log "✖ Refusing: the running backend has SYNAPSE_MOCK_MODELS=1 — a run against it would"
+      log "  make ZERO real provider calls yet still be labeled a live smoke."
+      log "  Restart the backend WITHOUT SYNAPSE_MOCK_MODELS, then re-run ./start.sh smoke."
+      exit 1
+    fi
+  fi
+
+  # 4) Spend estimate + explicit confirmation, BEFORE any paid call. SYNAPSE_SMOKE_YES=1 is the
+  # documented non-interactive bypass (agent/CI-adjacent automation that has already reviewed
+  # the cost) — it is the ONLY way past this gate without a real TTY [y/N] answer.
   echo ""
   log "About to make REAL, PAID provider calls:"
   echo "     Anthropic distill  ${C_DIM}model ${SUMMARIZER_MODEL:-claude-sonnet-5}; server-side cost guard at${C_OFF} ${SUMMARIZE_CONFIRM_THRESHOLD:-20000} ${C_DIM}est. tokens (SUMMARIZE_CONFIRM_THRESHOLD)${C_OFF}"
   echo "     OpenAI render      ${C_DIM}model ${IMAGE_MODEL:-gpt-image-1}; one image${C_OFF}"
+  echo "     ${C_DIM}A non-spending token estimate for the actual node runs first — see step 1/2 below.${C_OFF}"
   echo ""
   if [ "${SYNAPSE_SMOKE_YES:-}" != "1" ]; then
     if [ -t 0 ]; then
@@ -484,10 +580,16 @@ cmd_smoke() {
   fi
 
   # 5) Run the two live smokes against the running backend; transcript every request/response.
+  # mktemp both creates the file AND guarantees a unique name (L3) — two runs in the same
+  # second (the old `date`-only name + `>`) used to silently overwrite one transcript with the
+  # other; this can never collide.
   local reports_dir; reports_dir="$(smoke_reports_dir)"
   mkdir -p "$reports_dir"
   local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  local transcript="$reports_dir/live_smoke_${ts}.md"
+  local transcript; transcript="$(mktemp "$reports_dir/live_smoke_${ts}_XXXXXX.md")" || {
+    log "✖ Could not create a transcript file under $reports_dir"
+    exit 1
+  }
   {
     echo "# Live smoke — $ts (issue #3)"
     echo ""
@@ -505,21 +607,34 @@ cmd_smoke() {
     exit 1
   fi
 
-  log "1/2 Distill — node '$node_id'..."
-  local estimate; estimate="$(curl -sf -X POST "http://localhost:$PORT/api/v1/distill" \
-    -H 'Content-Type: application/json' \
-    -d "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"confirm\": false}")"
+  # 1/2 — a REAL, NON-SPENDING estimate (dry_run: true — issue #3 fix-loop F1). The OLD
+  # `confirm: false` call LOOKED free but was not: below the cost-guard threshold the server
+  # runs the real summarizer regardless, so every run spent twice and the transcript mislabeled
+  # a completed, paid summarization as "before spending". dry_run never reaches the summarizer.
+  log "1/2 Distill — node '$node_id'... (non-spending estimate)"
+  if ! smoke_post_json "http://localhost:$PORT/api/v1/distill" \
+      "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"dry_run\": true}"; then
+    smoke_transcript_failure "$transcript" "Distill — cost estimate" "$SMOKE_LAST_STATUS" "$SMOKE_LAST_BODY"
+    log "✖ Distill estimate request failed (HTTP ${SMOKE_LAST_STATUS:-unreachable}) — see $transcript. No paid calls were made."
+    exit 3
+  fi
+  local estimate="$SMOKE_LAST_BODY"
   {
-    echo "## Distill — node \`$node_id\` — cost estimate (before spending)"
+    echo "## Distill — node \`$node_id\` — cost estimate (before spending, zero-cost dry run)"
     echo '```json'
     echo "$estimate"
     echo '```'
   } >>"$transcript"
   log "  estimate: $estimate"
 
-  local distill_result; distill_result="$(curl -sf -X POST "http://localhost:$PORT/api/v1/distill" \
-    -H 'Content-Type: application/json' \
-    -d "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"confirm\": true}")"
+  # The ONE paid distill call — never a second one (F1: no double-spend).
+  if ! smoke_post_json "http://localhost:$PORT/api/v1/distill" \
+      "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"confirm\": true}"; then
+    smoke_transcript_failure "$transcript" "Distill — result" "$SMOKE_LAST_STATUS" "$SMOKE_LAST_BODY"
+    log "✖ Distill request failed (HTTP ${SMOKE_LAST_STATUS:-unreachable}) — see $transcript. No render call was made."
+    exit 3
+  fi
+  local distill_result="$SMOKE_LAST_BODY"
   {
     echo ""
     echo "## Distill — result"
@@ -536,9 +651,13 @@ cmd_smoke() {
   fi
 
   log "2/2 Render — summary '$summary_id'..."
-  local render_result; render_result="$(curl -sf -X POST "http://localhost:$PORT/api/v1/render" \
-    -H 'Content-Type: application/json' \
-    -d "{\"summary_note_id\": \"$summary_id\"}")"
+  if ! smoke_post_json "http://localhost:$PORT/api/v1/render" \
+      "{\"summary_note_id\": \"$summary_id\"}"; then
+    smoke_transcript_failure "$transcript" "Render" "$SMOKE_LAST_STATUS" "$SMOKE_LAST_BODY"
+    log "✖ Render request failed (HTTP ${SMOKE_LAST_STATUS:-unreachable}) — see $transcript. The distill above already spent; this failure did not, and nothing further was attempted."
+    exit 3
+  fi
+  local render_result="$SMOKE_LAST_BODY"
   {
     echo ""
     echo "## Render — result"

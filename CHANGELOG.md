@@ -11,9 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`./start.sh smoke`** (issue #3) — wraps the two opt-in live-model smokes (real Anthropic
   distill, real gpt-image-1 render) that were previously runbook steps. Refuses unconditionally
   in CI; refuses keyless with an actionable message naming the missing key(s), exit 1 (never the
-  unknown-command exit 2); shows the spend estimate and asks before making a paid call; records a
-  transcript under the active sprint's `reports/` dir. `backend/tests/test_start_smoke.py` pins
-  the refusal contract.
+  unknown-command exit 2); refuses against a `SYNAPSE_MOCK_MODELS=1` backend (never mislabels a
+  zero-spend run as live); shows a genuinely non-spending token estimate (`POST /api/v1/distill
+  {dry_run: true}` — new, zero-cost path, `backend/modules/distill/src/service.py`) and asks
+  before making the ONE paid distill call (never two); a failed provider call is diagnosed, the
+  transcript records what succeeded and failed (never silently truncated), and the command exits
+  a documented code (3), not a bare curl status. Transcripts get a collision-proof filename
+  (`mktemp`) under the active sprint's `reports/` dir; `SYNAPSE_SMOKE_YES=1` is the documented
+  non-interactive confirmation bypass. `backend/tests/test_start_smoke.py` pins the refusal
+  contract, the confirmation-before-spend ordering, the single-paid-call invariant, the `.env`
+  loader's tolerance of comments/odd keys, and the provider-failure diagnostics.
 
 ## [0.2.0] — 2026-08-06 · "the open, secured, movable brain"
 

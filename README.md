@@ -348,9 +348,10 @@ listed there is actually read by the app; shell/CI variables override the file):
 ```bash
 ./start.sh test                     # the full backend unit/API suite — ZERO paid model calls
 ./start.sh smoke                    # opt-in LIVE smoke: real Anthropic distill + real gpt-image
-                                     # render — needs both keys, never runs in CI, asks before
-                                     # spending, records a transcript under the active sprint's
-                                     # reports/ dir (issue #3)
+                                    # render — needs both keys, never runs in CI, shows a
+                                    # non-spending estimate and asks before spending, records a
+                                    # transcript under the active sprint's reports/ dir (issue #3).
+                                    # SYNAPSE_SMOKE_YES=1 skips the interactive confirm.
 ```
 
 E2E is a **real Chromium browser** (Playwright — `page.goto()`, visibility assertions,

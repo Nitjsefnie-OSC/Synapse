@@ -125,6 +125,22 @@ class DistillService:
     def tokens_est(notes: list[SourceNote]) -> int:
         return sum(len(n.body) for n in notes) // 4
 
+    # ── the non-spending estimate (issue #3 fix-loop, F1) ───────────────────
+    def estimate(self, node_id: str, scope: str = "node", depth: int = 2) -> dict:
+        """Collect the exact source set `distill()` would use and report its true token
+        estimate — NEVER calls the summarizer. This is the honest "cost estimate before
+        spending": `distill(confirm=False)` looked free but was not (it still ran the real
+        summarizer below the confirm threshold); this path makes no provider call at all."""
+        notes, truncated = self.collect(node_id, scope, depth)
+        est = self.tokens_est(notes)
+        return {
+            "tokens_est": est,
+            "threshold": self.confirm_threshold,
+            "requires_confirmation": est > self.confirm_threshold,
+            "truncated": truncated,
+            "sources": [n.note_id for n in notes],
+        }
+
     # ── the pipeline ──────────────────────────────────────────────────────
     def distill(self, node_id: str, scope: str = "node", depth: int = 2, confirm: bool = False) -> dict:
         notes, truncated = self.collect(node_id, scope, depth)

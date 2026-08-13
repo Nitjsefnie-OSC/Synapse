@@ -18,6 +18,8 @@ class DistillRequest(BaseModel):
     scope: str = "node"          # node | subtree
     depth: int = Field(2, ge=0, le=10)   # bounded — an unbounded int would pin the worker
     confirm: bool = False
+    dry_run: bool = False        # true → DistillService.estimate(): zero provider calls,
+                                  # the real token estimate for this exact node/scope/depth
 
 
 def _service() -> DistillService:
@@ -35,8 +37,16 @@ def _service() -> DistillService:
 
 @router.post("/distill")
 def distill(req: DistillRequest) -> dict:
+    svc = _service()
+    if req.dry_run:
+        # Non-spending path: collects the source set and reports the true token estimate.
+        # Never reaches svc.summarizer — no ConfirmationRequired/GroundingError possible here.
+        try:
+            return svc.estimate(req.node_id, req.scope, req.depth)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e.args[0]))
     try:
-        return _service().distill(req.node_id, req.scope, req.depth, req.confirm)
+        return svc.distill(req.node_id, req.scope, req.depth, req.confirm)
     except ConfirmationRequired as c:
         return {"requires_confirmation": True, "tokens_est": c.tokens_est, "threshold": c.threshold}
     except KeyError as e:

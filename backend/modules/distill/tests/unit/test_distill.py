@@ -158,6 +158,21 @@ class TestDistill:
         assert len(sid.encode("utf-8")) <= 200
         assert (v / "notes" / sid).is_file()   # written, not OSError'd after the spend
 
+    def test_estimate_never_calls_the_summarizer_and_matches_collect(self, service):
+        """Issue #3 fix-loop F1 — a non-spending estimate must never touch the summarizer,
+        and must report exactly `tokens_est(collect(...))` for the same args."""
+        class ExplodingSummarizer(Summarizer):
+            def summarize(self, subject, notes, scope):
+                raise AssertionError("estimate() must never call summarize()")
+
+        svc = DistillService(service.vault_path, ExplodingSummarizer(), confirm_threshold=20000)
+        out = svc.estimate(ALPHA, scope="subtree", depth=1)
+        notes, truncated = svc.collect(ALPHA, "subtree", 1)
+        assert out["tokens_est"] == svc.tokens_est(notes)
+        assert out["truncated"] == truncated
+        assert out["threshold"] == 20000
+        assert "summary_note_id" not in out
+
     def test_truncation_is_disclosed(self, vault):
         svc = DistillService(vault, MockSummarizer())
         svc.hard_cap_chars = 150                     # tiny safety cap → the subtree must be cut

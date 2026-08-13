@@ -94,6 +94,57 @@ def test_model_endpoints_fail_actionably_without_keys(client, monkeypatch):
     assert r.status_code == 400 and "ANTHROPIC_API_KEY" in r.json()["detail"]
 
 
+def test_distill_dry_run_makes_zero_summarizer_calls_and_returns_the_true_estimate(client, monkeypatch):
+    """Issue #3 fix-loop, F1 — the adversary proved `confirm: false` is NOT a free estimate: it
+    still runs the real summarizer below the cost-guard threshold (every ./start.sh smoke run
+    spent twice). `dry_run: true` must be a genuinely non-spending path: never call
+    Summarizer.summarize(), and the tokens_est it reports must match the real, independently
+    computed estimate for the exact same source set — not a guess, not the static threshold."""
+    monkeypatch.setenv("SYNAPSE_MOCK_MODELS", "1")
+    client.post("/api/v1/ingest")
+    client.post("/api/v1/rebuild")
+
+    from modules.distill.src.providers import MockSummarizer
+
+    calls = []
+    original = MockSummarizer.summarize
+
+    def spying_summarize(self, subject, notes, scope):
+        calls.append((subject, scope))
+        return original(self, subject, notes, scope)
+
+    monkeypatch.setattr(MockSummarizer, "summarize", spying_summarize)
+
+    r = client.post("/api/v1/distill", json={
+        "node_id": "repo_a__docs__alpha.md", "scope": "subtree", "depth": 1, "dry_run": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert calls == [], (
+        f"dry_run must never invoke the summarizer — it did: {calls}\nresponse={body}"
+    )
+    assert body.get("summary_note_id") is None, (
+        f"dry_run must never write a summary note — got {body}"
+    )
+
+    # the TRUE estimate, computed independently of the endpoint under test (same source
+    # collection the real distill() would use) — not a constant, not the confirm threshold.
+    from app.core.config import load_settings
+    from modules.distill.src.service import DistillService
+
+    settings = load_settings()
+    reference = DistillService(settings.vault_path, MockSummarizer(), settings.confirm_threshold_tokens)
+    notes, truncated = reference.collect("repo_a__docs__alpha.md", "subtree", 1)
+    true_estimate = reference.tokens_est(notes)
+
+    assert body.get("tokens_est") == true_estimate, (
+        f"dry_run tokens_est={body.get('tokens_est')!r} does not match the true estimate "
+        f"{true_estimate} for the same source set"
+    )
+    assert body.get("threshold") == settings.confirm_threshold_tokens
+    assert body.get("truncated") == truncated
+
+
 def test_roots_crud_with_prune(client, tmp_path, monkeypatch):
     # starts from the env-seeded list (source: env)
     roots = client.get("/api/v1/roots").json()
