@@ -3,6 +3,7 @@ independent adversary's findings across three rounds:
   round 1 (F1-F4, L1-L6) on candidate 855c2e709c62accce9915a05952d5b06e403c901
   round 2 (D1-D5)        on candidate 6ae6406701485d313ae617ad3c0891aec7f6bfef
   round 3 (E1-E3)        on candidate 801da4f6db15220351cddff7e1240d413de144e3
+  round 4 (G1-G3)        on candidate d1336fc97f5a744ebe114fd852d9cc61e5b46c43
 
   E1 no orphan transcript -> a refused/declined run (nothing spent, no provider execution
                               begun) leaves NO transcript file; a real failure (dry-run HTTP
@@ -12,6 +13,15 @@ independent adversary's findings across three rounds:
                               (which the separate raw-JSON log line would also satisfy).
   E3 paid/free ground truth-> a distill POST is classified paid unless `dry_run` is explicitly
                               true — `confirm: false` or an omitted `confirm` is NOT free.
+  G1 the spend gate is pinned-> the "refuse rather than spend on an estimate we can't state"
+                              gate has its own test, so deleting it can no longer leave the
+                              suite green while SYNAPSE_SMOKE_YES=1 spends blind.
+  G2 the gate is a VALIDITY -> tokens_est/threshold must be real numbers; a null, a string, a
+     check, not a sentinel     blank or a missing field refuses too, not only the literal "?".
+  G3 one transcript, really -> the once-only memo lives in the PARENT shell: no call site may
+                              run `smoke_ensure_transcript` in a subshell (`$( )`), where the
+                              memo is discarded and a second call would split the evidence
+                              across two files.
 
 The two live smokes (real Anthropic distill, real gpt-image-1 render) spend real money. This
 suite proves the invariants that must hold no matter how the happy path is implemented:
@@ -589,6 +599,201 @@ class TestNoOrphanTranscript:
         )
 
 
+# ── G1 / G2 — an estimate the banner cannot honestly state must never be spent on ──
+#
+# Delta-adversary G1: the "refuse rather than spend blind" gate shipped with ZERO test coverage —
+# deleting it left the whole suite green while a SYNAPSE_SMOKE_YES=1 run happily spent real money
+# on a banner reading "Estimated cost: ? tokens".
+# Delta-adversary G2: the gate only recognised the literal "?" sentinel (which start.sh's python
+# helper emits solely when the KEY IS ABSENT), so any parseable-but-non-numeric value walked
+# straight through it — `{"tokens_est": null}` printed "Estimated cost: None tokens" and spent.
+# Every shape below is a response the command cannot turn into a truthful consent banner, so
+# every one of them must refuse BEFORE any paid call, whatever consent was pre-granted.
+
+UNUSABLE_ESTIMATE_BODIES = {
+    # not an object at all — nothing to read tokens_est/threshold out of (the G1 repro)
+    "non_object_body": ["not", "a", "dict"],
+    # parseable, right keys, values that are not numbers (the G2 repro)
+    "null_values": {"tokens_est": None, "threshold": None,
+                    "requires_confirmation": None, "truncated": None},
+    "string_values": {"tokens_est": "many", "threshold": "lots",
+                      "requires_confirmation": False, "truncated": False},
+    "blank_values": {"tokens_est": "", "threshold": "",
+                     "requires_confirmation": False, "truncated": False},
+    # a real number for one field, nothing at all for the other
+    "missing_threshold": {"tokens_est": 64, "requires_confirmation": False, "truncated": False},
+}
+
+
+class TestUnusableEstimateRefusesInsteadOfSpending:
+    @pytest.mark.parametrize("shape", list(UNUSABLE_ESTIMATE_BODIES))
+    def test_estimate_without_real_numbers_refuses_before_any_paid_call(
+            self, shape, tmp_path, stub_backend):
+        """The dry run answers 2xx with a body the command cannot state a real cost from. Consent
+        is pre-granted (SYNAPSE_SMOKE_YES=1), so nothing else stands between this response and
+        real money: the command must exit the documented failure code (3) with ZERO paid POSTs
+        rather than print a placeholder cost and spend against it."""
+        stub_backend.dry_run_body = UNUSABLE_ESTIMATE_BODIES[shape]
+        envfile = _keys_env_file(tmp_path)
+        reports_dir = tmp_path / "reports"
+        r = _run_smoke(tmp_path, extra_env={
+            "SYNAPSE_ENV_FILE": str(envfile),
+            "PORT": str(stub_backend.port),
+            "SYNAPSE_SMOKE_YES": "1",
+            "SYNAPSE_SMOKE_REPORTS_DIR": str(reports_dir),
+        })
+        combined = r.stdout + r.stderr
+        assert r.returncode == 3, (
+            f"an estimate with no usable tokens_est/threshold ({shape}) must refuse with the "
+            f"documented failure code (3), never proceed to spend; "
+            f"got returncode={r.returncode}\n{combined}"
+        )
+        paid = [req for req in stub_backend.requests if _is_paid_request(req)]
+        assert paid == [], (
+            f"the command must not spend on an estimate it cannot state ({shape}); "
+            f"backend saw: {paid}"
+        )
+        assert "refusing rather than risk spending blind" in combined, combined
+
+    def test_the_refusal_keeps_the_evidence_it_refused_on(self, tmp_path, stub_backend):
+        """The counterpart to E1's 'no orphan transcript': an unusable estimate is a REAL backend
+        problem (a 2xx that violates the response contract), not a clean refusal — the transcript
+        must be created and must carry the offending body, exactly like any other dry-run
+        failure. This is the same evidence-retention doctrine as F4/D4."""
+        stub_backend.dry_run_body = UNUSABLE_ESTIMATE_BODIES["non_object_body"]
+        envfile = _keys_env_file(tmp_path)
+        reports_dir = tmp_path / "reports"
+        r = _run_smoke(tmp_path, extra_env={
+            "SYNAPSE_ENV_FILE": str(envfile),
+            "PORT": str(stub_backend.port),
+            "SYNAPSE_SMOKE_YES": "1",
+            "SYNAPSE_SMOKE_REPORTS_DIR": str(reports_dir),
+        })
+        combined = r.stdout + r.stderr
+        assert r.returncode == 3, f"expected the documented failure code (3)\n{combined}"
+        transcript = _newest_transcript(reports_dir)
+        text = transcript.read_text(encoding="utf-8")
+        assert "FAILED" in text and "unparsable" in text, (
+            f"the unusable estimate must be recorded as a FAILED section, not silently dropped:"
+            f"\n{text}"
+        )
+        assert json.dumps(UNUSABLE_ESTIMATE_BODIES["non_object_body"]) in text, (
+            f"the FAILED section must carry the response body it refused on:\n{text}"
+        )
+        assert FAKE_ANTHROPIC_KEY not in text and FAKE_OPENAI_KEY not in text, (
+            "a secret leaked into the transcript"
+        )
+
+
+# ── G3 — the transcript's once-only memo must live in the PARENT shell ──────────
+
+_ENSURE_PROBE = r"""
+# Unit-probes `smoke_ensure_transcript` inside start.sh's own shell. Sourcing start.sh runs its
+# dispatch `case`, which always exits (an unknown command prints usage and exits 2) — the EXIT
+# trap below then runs in that SAME shell, with every function defined and every global intact,
+# which is the only way to unit-test a helper of a self-dispatching script without copying it.
+_probe() {
+  # The trap fires while the `source` below is still running, so it inherits that command's
+  # redirections — findings go to an explicit file, never to the probe's own stdout.
+  # Each ensure call's own stdout is redirected to a file too (a redirection does NOT create a
+  # subshell, so the memo survives): the path must come back through _SMOKE_TRANSCRIPT.
+  smoke_ensure_transcript >"$PROBE_DIR/ensure1.out" \
+    || { echo "PROBE_ENSURE_FAILED=1" >>"$PROBE_DIR/probe.txt"; exit 90; }
+  echo "PROBE_FIRST=$_SMOKE_TRANSCRIPT" >>"$PROBE_DIR/probe.txt"
+  smoke_ensure_transcript >"$PROBE_DIR/ensure2.out" \
+    || { echo "PROBE_ENSURE_FAILED=2" >>"$PROBE_DIR/probe.txt"; exit 91; }
+  echo "PROBE_SECOND=$_SMOKE_TRANSCRIPT" >>"$PROBE_DIR/probe.txt"
+  exit 0
+}
+trap _probe EXIT
+source "$START_SH" __probe_never_a_real_command__ >/dev/null 2>&1
+"""
+
+
+def _probe_value(output, key):
+    for line in output.splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1]
+    return None
+
+
+class TestTranscriptIsCreatedOnceInTheParentShell:
+    """Delta-adversary G3: `smoke_ensure_transcript`'s "created lazily, on first use, and only
+    once" guard was a no-op — every call site ran it as `$(smoke_ensure_transcript)`, i.e. in a
+    SUBSHELL, so `_SMOKE_TRANSCRIPT` in the parent stayed empty and a second call would have
+    created a SECOND file, splitting one run's evidence across two half-transcripts (the
+    adversary's P9 refactor — reaching for the helper again on the render-failure path, exactly
+    how the two pre-consent failure paths already obtained it — produced precisely that)."""
+
+    def test_no_call_site_runs_the_helper_in_a_subshell(self):
+        text = START_SH.read_text(encoding="utf-8")
+        offenders = [
+            f"{n}: {line.strip()}"
+            for n, line in enumerate(text.splitlines(), 1)
+            # comment lines can't spawn a subshell — and the helper's own doc comment names the
+            # forbidden form on purpose, so matching those would pin the documentation instead
+            if "$(smoke_ensure_transcript" in line and not line.lstrip().startswith("#")
+        ]
+        assert offenders == [], (
+            "a command substitution runs smoke_ensure_transcript in a SUBSHELL, where the "
+            "once-only `_SMOKE_TRANSCRIPT` memo it sets is discarded on return — callers must "
+            "invoke it bare and read `$_SMOKE_TRANSCRIPT`, or the guard is decorative and a "
+            "second call silently splits the run's evidence across two files:\n"
+            + "\n".join(offenders)
+        )
+
+    def test_two_calls_reuse_one_file_and_publish_it_to_the_caller(self, tmp_path):
+        probe = tmp_path / "ensure_probe.sh"
+        probe.write_text(_ENSURE_PROBE, encoding="utf-8")
+        probe_dir = tmp_path / "probe"
+        probe_dir.mkdir()
+        reports_dir = tmp_path / "reports"
+        r = subprocess.run(
+            ["bash", str(probe)],
+            cwd=REPO_ROOT,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "HOME": str(tmp_path),
+                "SYNAPSE_ENV_FILE": str(tmp_path / "scratch.env"),
+                "SYNAPSE_SMOKE_REPORTS_DIR": str(reports_dir),
+                "START_SH": str(START_SH),
+                "PROBE_DIR": str(probe_dir),
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+        combined = r.stdout + r.stderr
+        assert r.returncode == 0, f"the probe could not create a transcript at all:\n{combined}"
+
+        findings = (probe_dir / "probe.txt").read_text(encoding="utf-8")
+        first = _probe_value(findings, "PROBE_FIRST")
+        second = _probe_value(findings, "PROBE_SECOND")
+        assert first, (
+            f"smoke_ensure_transcript must publish the path in the CALLER's shell via "
+            f"_SMOKE_TRANSCRIPT; probe findings were:\n{findings}\n{combined}"
+        )
+        assert second == first, (
+            f"the second call must reuse the memoized transcript, not make a new one; "
+            f"got {second!r} after {first!r}"
+        )
+        assert _transcript_files(reports_dir) == [Path(first)], (
+            f"exactly one transcript must exist after two calls — one run's evidence must never "
+            f"be split across files; got {_transcript_files(reports_dir)}"
+        )
+        assert "# Live smoke" in Path(first).read_text(encoding="utf-8"), (
+            "the transcript must still be created with its header on first use"
+        )
+        for out in sorted(probe_dir.glob("ensure*.out")):
+            assert out.read_text(encoding="utf-8") == "", (
+                f"the helper must hand the path back through _SMOKE_TRANSCRIPT, never on stdout "
+                f"— a stdout contract is what invites `$(smoke_ensure_transcript)` back, and "
+                f"that subshell is where the once-only memo dies; {out.name} held "
+                f"{out.read_text(encoding='utf-8')!r}"
+            )
+
+
 # ── F1 — one non-spending estimate, exactly one paid distill, never two ─────────
 
 class TestNoDoubleSpend:
@@ -735,6 +940,11 @@ class TestProviderFailureIsRecordedNotSwallowed:
 
         transcript = _newest_transcript(reports_dir)
         text = transcript.read_text(encoding="utf-8")
+        assert "cost estimate (before spending, zero-cost dry run)" in text, (
+            f"the pre-spend estimate section — the artifact F1 was originally about — must "
+            f"survive in the transcript of a run that actually spent (it is written after "
+            f"consent now, from the already-fetched dry-run body):\n{text}"
+        )
         assert "## Distill — result" in text, (
             f"the successful distill must still be recorded before the render failure:\n{text}"
         )

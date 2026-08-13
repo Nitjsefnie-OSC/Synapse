@@ -513,14 +513,20 @@ smoke_reports_dir() {
 # one that creates it; every failure state from that point on (paid distill, missing
 # summary_note_id, render) is guaranteed a transcript to record into (F4/D4 — evidence for
 # successful AND post-spend-failed runs is never lost).
+#
+# The path comes back in the GLOBAL `_SMOKE_TRANSCRIPT`, never on stdout, and callers must invoke
+# this BARE — never as `$(smoke_ensure_transcript)` (G3): a command substitution runs it in a
+# SUBSHELL, so the memo below is discarded on return and the "only once" guard becomes
+# decorative. A second caller would then create a SECOND file and split one run's evidence
+# across two half-transcripts. Returns 1 (having created nothing) if the file cannot be made;
+# every caller turns that into its own documented exit code.
 _SMOKE_TRANSCRIPT=""
 smoke_ensure_transcript() {
   if [ -n "$_SMOKE_TRANSCRIPT" ]; then
-    echo "$_SMOKE_TRANSCRIPT"
     return 0
   fi
   local reports_dir; reports_dir="$(smoke_reports_dir)"
-  mkdir -p "$reports_dir"
+  mkdir -p "$reports_dir" || return 1
   local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
   # mktemp both creates the file AND guarantees a unique name (L3) — two runs in the same
   # second (a `date`-only name + `>`) would silently overwrite one transcript with the other.
@@ -532,7 +538,17 @@ smoke_ensure_transcript() {
     echo ""
   } >"$t"
   _SMOKE_TRANSCRIPT="$t"
-  echo "$t"
+}
+
+# True only for a value the consent banner can honestly state as a cost: a non-negative decimal
+# number (G2). Everything else — "" , "?" (the parser's absent-key sentinel), "None" (a JSON
+# null), "many", "1e5", "-1" — is refused, because a banner reading "Estimated cost: None tokens"
+# is not informed consent, and SYNAPSE_SMOKE_YES=1 would spend against it.
+smoke_is_number() {
+  case "$1" in
+    "" | "." | *[!0-9.]* | *.*.*) return 1 ;;
+  esac
+  return 0
 }
 
 # One safe HTTP JSON POST: captures the status code AND the body (NEVER `-f`, which discards
@@ -640,10 +656,11 @@ cmd_smoke() {
   log "Estimating cost for node '$node_id'... (non-spending)"
   if ! smoke_post_json "http://localhost:$PORT/api/v1/distill" \
       "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"dry_run\": true}"; then
-    local transcript; transcript="$(smoke_ensure_transcript)" || {
+    smoke_ensure_transcript || {
       log "✖ Distill estimate request failed AND could not create a transcript under $(smoke_reports_dir)"
       exit 3
     }
+    local transcript="$_SMOKE_TRANSCRIPT"
     smoke_transcript_failure "$transcript" "Distill — cost estimate" "$SMOKE_LAST_STATUS" "$SMOKE_LAST_BODY"
     log "✖ Distill estimate request failed (HTTP ${SMOKE_LAST_STATUS:-unreachable}) — see $transcript. No paid calls were made."
     exit 3
@@ -668,17 +685,21 @@ print('yes' if d.get('requires_confirmation') else 'no')
   { IFS= read -r tokens_est_val; IFS= read -r threshold_val; IFS= read -r truncated_val; \
     IFS= read -r requires_confirmation_val; } <<<"$est_fields"
 
-  # Refuse rather than consent to a number that doesn't exist (N2) — a 2xx response with an
-  # unparsable/non-object body would otherwise degrade the banner to "? tokens" and let
-  # SYNAPSE_SMOKE_YES=1 spend blind. This is genuine evidence of a real problem — worth a
-  # transcript, same as any other dry-run failure above.
-  if [ "$tokens_est_val" = "?" ] || [ "$threshold_val" = "?" ]; then
-    local transcript; transcript="$(smoke_ensure_transcript)" || {
-      log "✖ Could not parse the cost estimate AND could not create a transcript under $(smoke_reports_dir)"
+  # Refuse rather than consent to a number that doesn't exist (N2/G2) — a 2xx response the
+  # banner cannot state a real cost from would otherwise degrade it to "? tokens" (a non-object
+  # body) or to "None tokens" (`"tokens_est": null` — python prints the string "None") and let
+  # SYNAPSE_SMOKE_YES=1 spend blind. So this is a VALIDITY check, not a sentinel check: only an
+  # actual number passes, which subsumes the '?' the parser above emits for an absent key.
+  # This is genuine evidence of a real problem — worth a transcript, same as any other dry-run
+  # failure above.
+  if ! smoke_is_number "$tokens_est_val" || ! smoke_is_number "$threshold_val"; then
+    smoke_ensure_transcript || {
+      log "✖ The cost estimate has no usable numbers AND no transcript could be created under $(smoke_reports_dir)"
       exit 3
     }
+    local transcript="$_SMOKE_TRANSCRIPT"
     smoke_transcript_failure "$transcript" "Distill — cost estimate (unparsable)" "$SMOKE_LAST_STATUS" "$estimate"
-    log "✖ Could not parse the cost estimate response — refusing rather than risk spending blind. See $transcript."
+    log "✖ The cost estimate response carries no usable tokens_est/threshold numbers (got '${tokens_est_val}' / '${threshold_val}') — refusing rather than risk spending blind. See $transcript."
     exit 3
   fi
 
@@ -715,10 +736,11 @@ print('yes' if d.get('requires_confirmation') else 'no')
   # a declined run above never reaches this line, so it never created one). Records the
   # already-fetched, already-shown estimate first, then the ONE paid distill call — never a
   # second one (F1: no double-spend).
-  local transcript; transcript="$(smoke_ensure_transcript)" || {
+  smoke_ensure_transcript || {
     log "✖ Could not create a transcript file under $(smoke_reports_dir)"
     exit 1
   }
+  local transcript="$_SMOKE_TRANSCRIPT"
   {
     echo "## Distill — node \`$node_id\` — cost estimate (before spending, zero-cost dry run)"
     echo '```json'
