@@ -284,6 +284,7 @@ cmd_help() {
   echo "     ./start.sh dev [--ui]   backend only, or backend + frontend"
   echo "     ./start.sh production   production server (Docker/CI — no reload)"
   echo "     ./start.sh test         run the test suite"
+  echo "     ./start.sh smoke        live-model smoke (real \$: Anthropic distill + gpt-image render) — opt-in, needs keys, never in CI"
   echo "     ./start.sh status       ports + health   ·   ./start.sh stop"
   echo "     ./start.sh preflight    check prerequisites only (Python, Node) — offers installs"
   echo ""
@@ -358,6 +359,195 @@ cmd_test() {
   else
     cd "$SCRIPT_DIR" && npm test
   fi
+}
+
+# ── smoke: wrap the two opt-in live-model smokes (issue #3, backlog #9) ─────
+#
+# The two paid-model flows — real Anthropic distill (backend/modules/distill/README.md) and real
+# gpt-image-1 render (backend/modules/render/README.md) — were runbook steps run by hand
+# (sprint-03 epic reports). This wraps them as one command, which is now the opt-in gate itself
+# (you must invoke it, and it asks before spending) — with the safety contract as the
+# load-bearing part:
+#   - never runs in CI, no matter what
+#   - refuses without both keys, actionably, exit 1 (never the unknown-command exit 2)
+#   - shows the spend estimate and asks before making a paid call
+#   - talks to an ALREADY-RUNNING backend (./start.sh dev / service) — it does not manage its
+#     own stack, so it never touches the app lifecycle
+#   - records a transcript under the active sprint's reports/ dir
+smoke_is_ci() {
+  case "${CI:-}" in true | TRUE | True | 1) return 0 ;; esac
+  [ -n "${GITHUB_ACTIONS:-}" ] && return 0
+  return 1
+}
+
+# The same env file the backend itself reads (app/core/config.py) — honors SYNAPSE_ENV_FILE so
+# tests/scratch stacks never touch a real backend/.env.
+smoke_env_file() {
+  if [ -n "${SYNAPSE_ENV_FILE:-}" ]; then
+    echo "$SYNAPSE_ENV_FILE"
+  else
+    echo "$(backend_dir)/$ENV_FILE"
+  fi
+}
+
+smoke_is_placeholder() {
+  case "$1" in "" | *REPLACE-ME*) return 0 ;; esac
+  return 1
+}
+
+_SMOKE_ENV_LOADED=false
+# Mirrors config.py's _load_dotenv: a real value already in the process env always wins; a
+# placeholder in the process env never blocks the file's real value.
+smoke_load_env_once() {
+  $_SMOKE_ENV_LOADED && return 0
+  _SMOKE_ENV_LOADED=true
+  local f; f="$(smoke_env_file)"
+  [ -f "$f" ] || return 0
+  local line key value current
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ""|"#"*) continue ;; esac
+    case "$line" in *=*) : ;; *) continue ;; esac
+    key="${line%%=*}"; value="${line#*=}"
+    key="$(echo "$key" | xargs)"
+    value="$(echo "$value" | xargs)"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    [ -z "$key" ] && continue
+    current="${!key:-}"
+    if [ -z "$current" ] || smoke_is_placeholder "$current"; then
+      export "$key=$value"
+    fi
+  done <"$f"
+}
+
+smoke_key_present() {
+  smoke_load_env_once
+  local val="${!1:-}"
+  ! smoke_is_placeholder "$val"
+}
+
+# Active sprint's reports dir, read from the sprint index graph node (never hardcoded — sprints
+# close and a new one opens). Falls back to the newest sprint dir if the index can't be parsed.
+smoke_reports_dir() {
+  local idx="$SCRIPT_DIR/project-management/sprints/00_index.md" sprint=""
+  if [ -f "$idx" ]; then
+    sprint="$(grep -m1 -E 'OPEN' "$idx" 2>/dev/null | grep -oE 'sprint_[0-9]+' | head -1 || true)"
+  fi
+  if [ -z "$sprint" ]; then
+    sprint="$(find "$SCRIPT_DIR/project-management/sprints" -maxdepth 1 -type d -name 'sprint_*' 2>/dev/null \
+      | sort | tail -1 | xargs -r basename)"
+  fi
+  echo "$SCRIPT_DIR/project-management/sprints/${sprint:-sprint_06}/reports"
+}
+
+cmd_smoke() {
+  # 1) CI refusal — unconditional, checked first, regardless of keys.
+  if smoke_is_ci; then
+    log "✖ Refusing: live-model smokes never run in CI (\$CI/\$GITHUB_ACTIONS detected)."
+    log "  These make real, paid calls to Anthropic and OpenAI — see backend/modules/{distill,render}/README.md."
+    exit 1
+  fi
+
+  # 2) Keyless refusal — actionable, exit 1 (distinct from the unknown-command exit 2).
+  local missing=()
+  smoke_key_present ANTHROPIC_API_KEY || missing+=("ANTHROPIC_API_KEY (Anthropic distill)")
+  smoke_key_present OPENAI_API_KEY || missing+=("OPENAI_API_KEY (OpenAI gpt-image-1 render)")
+  if [ ${#missing[@]} -gt 0 ]; then
+    log "✖ Refusing: the live smoke needs real provider keys — missing:"
+    local m; for m in "${missing[@]}"; do echo "     ✖ $m"; done
+    log "  Set them in $(smoke_env_file) (see .env.example), then re-run ./start.sh smoke."
+    exit 1
+  fi
+
+  # 3) Needs an already-running backend — this command never manages the app lifecycle.
+  if ! curl -sf -o /dev/null "http://localhost:$PORT$HEALTH_PATH" 2>/dev/null; then
+    log "✖ Refusing: no backend answering on http://localhost:$PORT$HEALTH_PATH"
+    log "  Start one first — ./start.sh dev (or ./start.sh service start) — then re-run ./start.sh smoke."
+    exit 1
+  fi
+
+  # 4) Spend estimate + explicit confirmation, BEFORE any paid call.
+  echo ""
+  log "About to make REAL, PAID provider calls:"
+  echo "     Anthropic distill  ${C_DIM}model ${SUMMARIZER_MODEL:-claude-sonnet-5}; server-side cost guard at${C_OFF} ${SUMMARIZE_CONFIRM_THRESHOLD:-20000} ${C_DIM}est. tokens (SUMMARIZE_CONFIRM_THRESHOLD)${C_OFF}"
+  echo "     OpenAI render      ${C_DIM}model ${IMAGE_MODEL:-gpt-image-1}; one image${C_OFF}"
+  echo ""
+  if [ "${SYNAPSE_SMOKE_YES:-}" != "1" ]; then
+    if [ -t 0 ]; then
+      printf "[start.sh] Proceed and spend real money? [y/N] "
+      local answer; read -r answer
+      case "$answer" in [yY]*) ;; *) log "Aborted — no calls made."; exit 1 ;; esac
+    else
+      log "✖ Non-interactive session — set SYNAPSE_SMOKE_YES=1 to confirm the spend and proceed."
+      exit 1
+    fi
+  fi
+
+  # 5) Run the two live smokes against the running backend; transcript every request/response.
+  local reports_dir; reports_dir="$(smoke_reports_dir)"
+  mkdir -p "$reports_dir"
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  local transcript="$reports_dir/live_smoke_${ts}.md"
+  {
+    echo "# Live smoke — $ts (issue #3)"
+    echo ""
+    echo "Backend: http://localhost:$PORT · model #1 ${SUMMARIZER_MODEL:-claude-sonnet-5} · model #2 ${IMAGE_MODEL:-gpt-image-1}"
+    echo ""
+  } >"$transcript"
+
+  local node_id="${SYNAPSE_SMOKE_NODE_ID:-}"
+  if [ -z "$node_id" ]; then
+    node_id="$(curl -sf "http://localhost:$PORT/api/v1/graph" 2>/dev/null \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); ns=d.get('nodes',[]); print(ns[0]['id'] if ns else '')" 2>/dev/null || true)"
+  fi
+  if [ -z "$node_id" ]; then
+    log "✖ Refusing: no node to distill — set SYNAPSE_SMOKE_NODE_ID, or configure SYNAPSE_SOURCE_REPOS and rebuild first."
+    exit 1
+  fi
+
+  log "1/2 Distill — node '$node_id'..."
+  local estimate; estimate="$(curl -sf -X POST "http://localhost:$PORT/api/v1/distill" \
+    -H 'Content-Type: application/json' \
+    -d "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"confirm\": false}")"
+  {
+    echo "## Distill — node \`$node_id\` — cost estimate (before spending)"
+    echo '```json'
+    echo "$estimate"
+    echo '```'
+  } >>"$transcript"
+  log "  estimate: $estimate"
+
+  local distill_result; distill_result="$(curl -sf -X POST "http://localhost:$PORT/api/v1/distill" \
+    -H 'Content-Type: application/json' \
+    -d "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"confirm\": true}")"
+  {
+    echo ""
+    echo "## Distill — result"
+    echo '```json'
+    echo "$distill_result"
+    echo '```'
+  } >>"$transcript"
+
+  local summary_id; summary_id="$(echo "$distill_result" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('summary_note_id',''))" 2>/dev/null || true)"
+  if [ -z "$summary_id" ]; then
+    log "✖ Distill did not return a summary note — see $transcript for the raw response. Render skipped."
+    exit 1
+  fi
+
+  log "2/2 Render — summary '$summary_id'..."
+  local render_result; render_result="$(curl -sf -X POST "http://localhost:$PORT/api/v1/render" \
+    -H 'Content-Type: application/json' \
+    -d "{\"summary_note_id\": \"$summary_id\"}")"
+  {
+    echo ""
+    echo "## Render — result"
+    echo '```json'
+    echo "$render_result"
+    echo '```'
+  } >>"$transcript"
+
+  log "${C_GR}✔${C_OFF} Live smoke complete — transcript: $transcript"
 }
 
 # ── service mode (sprint 06, Epic Q — "run as an APP and not die") ───────────
@@ -570,6 +760,7 @@ case "${1:-}" in
   status)         cmd_status ;;
   service)        shift; cmd_service "$@" ;;
   test)           shift; cmd_test "$@" ;;
+  smoke)          cmd_smoke ;;
   dev)            shift; cmd_dev "$@" ;;
   preflight)      preflight true && log "All prerequisites OK."; exit 0 ;;
   production)     preflight false; cmd_production ;;

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`./start.sh smoke`** (issue #3) — wraps the two opt-in live-model smokes (real Anthropic
+  distill, real gpt-image-1 render) that were previously runbook steps. Refuses unconditionally
+  in CI; refuses keyless with an actionable message naming the missing key(s), exit 1 (never the
+  unknown-command exit 2); shows the spend estimate and asks before making a paid call; records a
+  transcript under the active sprint's `reports/` dir. `backend/tests/test_start_smoke.py` pins
+  the refusal contract.
+
 ## [0.2.0] — 2026-08-06 · "the open, secured, movable brain"
 
 The graph learned to say what a node **is**, the reader learned to show media inline, a security

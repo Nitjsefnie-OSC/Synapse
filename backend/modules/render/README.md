@@ -11,4 +11,4 @@ keep it. Re-render swaps the image idempotently.
   hash, used by all tests and `SYNAPSE_MOCK_MODELS=1`.
 - Only summary notes render (`NotASummary` 422 otherwise — distill first).
 - `POST /api/v1/render {summary_note_id}` · images served at `GET /media/<file>`.
-- Live smoke: opt-in `RUN_LIVE_RENDER_SMOKE=1` (never CI).
+- Live smoke: opt-in, via `./start.sh smoke` (issue #3) — needs real keys, never CI.

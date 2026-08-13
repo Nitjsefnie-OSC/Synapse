@@ -70,7 +70,7 @@ layout is the shared contract (documented here, versioned in `graph.json.schema_
 - **Honesty:** every pipeline step reports real counts; truncation is always disclosed;
   zero-citation summaries are failures.
 - **Cost safety:** token-estimate confirm gate on distill; live smokes opt-in
-  (`RUN_LIVE_*_SMOKE=1`), never CI.
+  (`./start.sh smoke`, issue #3), never CI.
 - **Scale target (POC):** two repos ≈ hundreds of notes / ~2k nodes interactive in the explorer.
 - **I18n:** UTF-8 end-to-end; Hebrew/RTL renders correctly in vault notes and the node panel.
 - **Security:** keys only in `backend/.env` (git-ignored); sanitized markdown rendering in the UI.

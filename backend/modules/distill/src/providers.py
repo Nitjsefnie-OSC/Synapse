@@ -1,7 +1,7 @@
 """
 The Summarizer seam — model #1 (Distill). The Anthropic SDK may be imported HERE and nowhere
 else (03_MODULE_CONTRACTS). Every test runs on MockSummarizer; AnthropicSummarizer is exercised
-by the opt-in live smoke (RUN_LIVE_DISTILL_SMOKE=1) and by founder acceptance with real keys.
+by the opt-in live smoke (`./start.sh smoke`, issue #3) and by founder acceptance with real keys.
 """
 
 from __future__ import annotations

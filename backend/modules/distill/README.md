@@ -12,7 +12,7 @@ sources wikilinked (so the next rebuild adds the summary to the graph, in its ow
   the summary SAYS it was truncated. Cost guard: est. tokens > `SUMMARIZE_CONFIRM_THRESHOLD`
   (default 20k) ⇒ `requires_confirmation` — the UI asks before spending.
 - `POST /api/v1/distill {node_id, scope: node|subtree, depth, confirm}`.
-- Live smoke: opt-in `RUN_LIVE_DISTILL_SMOKE=1` (never CI).
+- Live smoke: opt-in, via `./start.sh smoke` (issue #3) — needs real keys, never CI.
 
 Deviation from the epic card (recorded): source-note backlinks are NOT written into source
 frontmatter — re-ingest would erase them; the graph provides reverse edges once the summary
