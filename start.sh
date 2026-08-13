@@ -505,6 +505,36 @@ smoke_reports_dir() {
   echo "$SCRIPT_DIR/project-management/sprints/${sprint:-sprint_06}/reports"
 }
 
+# Creates the transcript file LAZILY, on first use, and only once (issue #3 fix-loop E1) — a
+# refused/declined run (nothing spent, no provider execution begun: CI/keys/backend/mock
+# refusals, an empty node list, or a plain "no" at the consent prompt) must never litter the
+# tracked reports dir with an orphan file that records nothing. The first caller that actually
+# has something to write (a dry-run failure, or a genuinely consented run about to spend) is the
+# one that creates it; every failure state from that point on (paid distill, missing
+# summary_note_id, render) is guaranteed a transcript to record into (F4/D4 — evidence for
+# successful AND post-spend-failed runs is never lost).
+_SMOKE_TRANSCRIPT=""
+smoke_ensure_transcript() {
+  if [ -n "$_SMOKE_TRANSCRIPT" ]; then
+    echo "$_SMOKE_TRANSCRIPT"
+    return 0
+  fi
+  local reports_dir; reports_dir="$(smoke_reports_dir)"
+  mkdir -p "$reports_dir"
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  # mktemp both creates the file AND guarantees a unique name (L3) — two runs in the same
+  # second (a `date`-only name + `>`) would silently overwrite one transcript with the other.
+  local t; t="$(mktemp "$reports_dir/live_smoke_${ts}_XXXXXX.md")" || return 1
+  {
+    echo "# Live smoke — $ts (issue #3)"
+    echo ""
+    echo "Backend: http://localhost:$PORT · model #1 ${SUMMARIZER_MODEL:-claude-sonnet-5} · model #2 ${IMAGE_MODEL:-gpt-image-1}"
+    echo ""
+  } >"$t"
+  _SMOKE_TRANSCRIPT="$t"
+  echo "$t"
+}
+
 # One safe HTTP JSON POST: captures the status code AND the body (NEVER `-f`, which discards
 # the body on failure — issue #3 fix-loop F4). Sets SMOKE_LAST_STATUS/SMOKE_LAST_BODY; returns
 # 0 for 2xx, 1 otherwise (a connection failure sets status "000", body empty) — it never aborts
@@ -524,9 +554,12 @@ smoke_post_json() {
   return 1
 }
 
-# Appends a FAILED section to the transcript — the safe response context (HTTP status + body,
-# never a secret: these are the PROVIDER'S OWN error responses, not request payloads), so a
-# reader can see exactly what failed without re-running anything. Whatever succeeded ABOVE this
+# Appends a FAILED section to the transcript — the response context this command actually has
+# (HTTP status + body; never a request payload, which is the only thing this command could
+# leak on purpose). This is response-body content from the LOCAL backend, not a guarantee about
+# what that backend chooses to put in an error body — see backend/modules/{distill,render}/src/
+# api.py for what it actually returns (names a missing variable, never its value; unhandled
+# exceptions surface as FastAPI's generic 500 with no detail). Whatever succeeded ABOVE this
 # section in the transcript stays fully recorded (F4 — no silent truncation).
 smoke_transcript_failure() {
   local transcript="$1" step="$2" status="$3" body="$4"
@@ -582,26 +615,10 @@ cmd_smoke() {
     fi
   fi
 
-  # 4) Set up the transcript early (issue #3 fix-loop D1) — a dry-run failure below must still
-  # be recorded, not just a paid-call failure. mktemp both creates the file AND guarantees a
-  # unique name (L3) — two runs in the same second (the old `date`-only name + `>`) used to
-  # silently overwrite one transcript with the other; this can never collide.
-  local reports_dir; reports_dir="$(smoke_reports_dir)"
-  mkdir -p "$reports_dir"
-  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  local transcript; transcript="$(mktemp "$reports_dir/live_smoke_${ts}_XXXXXX.md")" || {
-    log "✖ Could not create a transcript file under $reports_dir"
-    exit 1
-  }
-  {
-    echo "# Live smoke — $ts (issue #3)"
-    echo ""
-    echo "Backend: http://localhost:$PORT · model #1 ${SUMMARIZER_MODEL:-claude-sonnet-5} · model #2 ${IMAGE_MODEL:-gpt-image-1}"
-    echo ""
-  } >"$transcript"
-
-  # 5) Select the node — BEFORE consent (D1): the operator must see the estimate for the node
-  # that will actually be distilled, not a generic promise.
+  # 4) Select the node — BEFORE consent (D1): the operator must see the estimate for the node
+  # that will actually be distilled, not a generic promise. Nothing was spent and no transcript
+  # exists yet if this refuses (E1 — no orphan file for the most likely first-run state: an
+  # empty vault, nothing ingested).
   local node_id="${SYNAPSE_SMOKE_NODE_ID:-}"
   if [ -z "$node_id" ]; then
     node_id="$(curl -sf "http://localhost:$PORT/api/v1/graph" 2>/dev/null \
@@ -612,25 +629,26 @@ cmd_smoke() {
     exit 1
   fi
 
-  # 6) A REAL, NON-SPENDING estimate (dry_run: true — F1), fetched BEFORE consent (D1). The OLD
+  # 5) A REAL, NON-SPENDING estimate (dry_run: true — F1), fetched BEFORE consent (D1). The OLD
   # `confirm: false` call LOOKED free but was not: below the cost-guard threshold the server
   # runs the real summarizer regardless, so every run spent twice and the transcript mislabeled
   # a completed, paid summarization as "before spending". dry_run never reaches the summarizer,
   # so this is the ONLY network call this command ever makes before the operator has consented.
+  # A FAILURE here is real diagnostic evidence (E1) — worth a transcript even though nothing was
+  # spent; a clean refusal below (declined consent) is not, so the transcript is NOT created
+  # until either this fails or consent is actually granted (smoke_ensure_transcript, lazy).
   log "Estimating cost for node '$node_id'... (non-spending)"
   if ! smoke_post_json "http://localhost:$PORT/api/v1/distill" \
       "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"dry_run\": true}"; then
+    local transcript; transcript="$(smoke_ensure_transcript)" || {
+      log "✖ Distill estimate request failed AND could not create a transcript under $(smoke_reports_dir)"
+      exit 3
+    }
     smoke_transcript_failure "$transcript" "Distill — cost estimate" "$SMOKE_LAST_STATUS" "$SMOKE_LAST_BODY"
     log "✖ Distill estimate request failed (HTTP ${SMOKE_LAST_STATUS:-unreachable}) — see $transcript. No paid calls were made."
     exit 3
   fi
   local estimate="$SMOKE_LAST_BODY"
-  {
-    echo "## Distill — node \`$node_id\` — cost estimate (before spending, zero-cost dry run)"
-    echo '```json'
-    echo "$estimate"
-    echo '```'
-  } >>"$transcript"
   log "  estimate: $estimate"
 
   # Parse the REAL numbers out of the estimate for the consent banner below — never re-derive
@@ -650,7 +668,21 @@ print('yes' if d.get('requires_confirmation') else 'no')
   { IFS= read -r tokens_est_val; IFS= read -r threshold_val; IFS= read -r truncated_val; \
     IFS= read -r requires_confirmation_val; } <<<"$est_fields"
 
-  # 7) Informed consent, BEFORE any paid call (D1) — honours requires_confirmation by SHOWING
+  # Refuse rather than consent to a number that doesn't exist (N2) — a 2xx response with an
+  # unparsable/non-object body would otherwise degrade the banner to "? tokens" and let
+  # SYNAPSE_SMOKE_YES=1 spend blind. This is genuine evidence of a real problem — worth a
+  # transcript, same as any other dry-run failure above.
+  if [ "$tokens_est_val" = "?" ] || [ "$threshold_val" = "?" ]; then
+    local transcript; transcript="$(smoke_ensure_transcript)" || {
+      log "✖ Could not parse the cost estimate AND could not create a transcript under $(smoke_reports_dir)"
+      exit 3
+    }
+    smoke_transcript_failure "$transcript" "Distill — cost estimate (unparsable)" "$SMOKE_LAST_STATUS" "$estimate"
+    log "✖ Could not parse the cost estimate response — refusing rather than risk spending blind. See $transcript."
+    exit 3
+  fi
+
+  # 6) Informed consent, BEFORE any paid call (D1) — honours requires_confirmation by SHOWING
   # it rather than silently overriding it: the operator (or the documented SYNAPSE_SMOKE_YES
   # bypass) decides with the real number in hand, not a config constant. SYNAPSE_SMOKE_YES=1
   # only counts as consent BECAUSE the estimate above is always printed first, interactive or
@@ -668,7 +700,10 @@ print('yes' if d.get('requires_confirmation') else 'no')
   if [ "${SYNAPSE_SMOKE_YES:-}" != "1" ]; then
     if [ -t 0 ]; then
       printf "[start.sh] Proceed and spend real money? [y/N] "
-      local answer; read -r answer
+      # `|| answer=""` (N1): EOF (Ctrl-D) makes `read` return nonzero — under `set -e` that used
+      # to abort the script silently, one line after the prompt, with no "Aborted" message. EOF
+      # now degrades to the same "empty answer" default-No path as pressing Enter.
+      local answer; read -r answer || answer=""
       case "$answer" in [yY]*) ;; *) log "Aborted — no calls made."; exit 1 ;; esac
     else
       log "✖ Non-interactive session — set SYNAPSE_SMOKE_YES=1 to confirm the spend and proceed."
@@ -676,7 +711,21 @@ print('yes' if d.get('requires_confirmation') else 'no')
     fi
   fi
 
-  # 8) The ONE paid distill call — never a second one (F1: no double-spend).
+  # 7) Consent granted — NOW the transcript exists for the rest of this run (E1: lazy creation;
+  # a declined run above never reaches this line, so it never created one). Records the
+  # already-fetched, already-shown estimate first, then the ONE paid distill call — never a
+  # second one (F1: no double-spend).
+  local transcript; transcript="$(smoke_ensure_transcript)" || {
+    log "✖ Could not create a transcript file under $(smoke_reports_dir)"
+    exit 1
+  }
+  {
+    echo "## Distill — node \`$node_id\` — cost estimate (before spending, zero-cost dry run)"
+    echo '```json'
+    echo "$estimate"
+    echo '```'
+  } >>"$transcript"
+
   log "1/2 Distill — node '$node_id'... (paid)"
   if ! smoke_post_json "http://localhost:$PORT/api/v1/distill" \
       "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"confirm\": true}"; then

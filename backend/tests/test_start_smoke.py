@@ -1,7 +1,17 @@
 """Issue #3 — `./start.sh smoke` safety-refusal contract, plus the fix-loop regressions for the
-independent adversary's findings across two rounds:
+independent adversary's findings across three rounds:
   round 1 (F1-F4, L1-L6) on candidate 855c2e709c62accce9915a05952d5b06e403c901
   round 2 (D1-D5)        on candidate 6ae6406701485d313ae617ad3c0891aec7f6bfef
+  round 3 (E1-E3)        on candidate 801da4f6db15220351cddff7e1240d413de144e3
+
+  E1 no orphan transcript -> a refused/declined run (nothing spent, no provider execution
+                              begun) leaves NO transcript file; a real failure (dry-run HTTP
+                              error, post-spend contract violation) still retains its evidence.
+  E2 the banner is real    -> the consent banner's own text ("Estimated cost: <N> tokens")
+                              carries the true per-node estimate, not merely somewhere in stdout
+                              (which the separate raw-JSON log line would also satisfy).
+  E3 paid/free ground truth-> a distill POST is classified paid unless `dry_run` is explicitly
+                              true — `confirm: false` or an omitted `confirm` is NOT free.
 
 The two live smokes (real Anthropic distill, real gpt-image-1 render) spend real money. This
 suite proves the invariants that must hold no matter how the happy path is implemented:
@@ -89,9 +99,13 @@ def _keys_env_file(tmp_path, extra_lines=""):
 
 
 def _is_paid_request(req):
-    """A request that would actually spend money: the CONFIRMED distill call (never the free
-    dry_run one) or any render call. Used to assert 'zero PAID POSTs before consent' (D1) —
-    distinct from 'zero POSTs at all', which the free dry-run estimate is now allowed to be."""
+    """A request that would actually spend money: any distill POST that is NOT an explicit
+    dry_run, or any render call. Ground truth (delta-adversary E3): `dry_run` is the ONLY thing
+    that routes a distill call away from the summarizer (api.py's dry_run branch) — `confirm:
+    false` or an OMITTED confirm is NOT free (service.py's distill() runs the real summarizer
+    below the cost-guard threshold regardless; that was the original F1 finding). A classifier
+    that only counted `confirm: true` as paid would wrongly wave through a `confirm: false` (or
+    confirm-omitted) distill call sent before consent as if it were the safe, free estimate."""
     method, path, body = req
     if method != "POST":
         return False
@@ -102,8 +116,44 @@ def _is_paid_request(req):
             parsed = json.loads(body) if body else {}
         except json.JSONDecodeError:
             parsed = {}
-        return bool(parsed.get("confirm")) and not parsed.get("dry_run")
+        return not parsed.get("dry_run")
     return False
+
+
+def _transcript_files(reports_dir):
+    return sorted(Path(reports_dir).glob("live_smoke_*.md"))
+
+
+# ── E3 — the paid/free classifier's ground truth ────────────────────────────────
+
+class TestPaidRequestClassifier:
+    """A pure unit test of `_is_paid_request` itself — no subprocess, no stub server. This is
+    the safety net every consent/double-spend test in this file relies on; if IT encodes the
+    wrong model of the backend (delta-adversary E3: a distill POST with `confirm: false` or an
+    omitted `confirm` is NOT free — service.py's distill() still runs the real summarizer below
+    the cost-guard threshold), every test built on top of it inherits the blind spot."""
+
+    def test_distill_confirm_false_or_omitted_is_paid(self):
+        assert _is_paid_request(("POST", "/api/v1/distill", json.dumps(
+            {"node_id": NODE_ID, "scope": "node", "confirm": False}))) is True
+        assert _is_paid_request(("POST", "/api/v1/distill", json.dumps(
+            {"node_id": NODE_ID, "scope": "node"}))) is True  # confirm omitted entirely
+
+    def test_distill_confirm_true_is_paid(self):
+        assert _is_paid_request(("POST", "/api/v1/distill", json.dumps(
+            {"node_id": NODE_ID, "scope": "node", "confirm": True}))) is True
+
+    def test_distill_dry_run_true_is_the_only_free_case(self):
+        assert _is_paid_request(("POST", "/api/v1/distill", json.dumps(
+            {"node_id": NODE_ID, "scope": "node", "dry_run": True}))) is False
+        # dry_run alongside confirm:true is still free — dry_run is what api.py branches on.
+        assert _is_paid_request(("POST", "/api/v1/distill", json.dumps(
+            {"node_id": NODE_ID, "scope": "node", "confirm": True, "dry_run": True}))) is False
+
+    def test_render_is_always_paid_and_gets_never_are(self):
+        assert _is_paid_request(("POST", "/api/v1/render", "{}")) is True
+        assert _is_paid_request(("GET", "/api/v1/graph", "")) is False
+        assert _is_paid_request(("GET", "/health", "")) is False
 
 
 # ── a safe, local, in-process stub backend ──────────────────────────────────────
@@ -121,8 +171,10 @@ class _StubHTTPServer(HTTPServer):
         self.dry_run_body: dict = {"tokens_est": 64, "threshold": 20000,
                                     "requires_confirmation": False, "truncated": False,
                                     "sources": [NODE_ID]}
+        self.dry_run_status = 200
         self.distill_status = 200
         self.distill_body: dict | None = None  # None -> the default 2xx summary shape below
+        self.graph_nodes: list = [{"id": NODE_ID}]  # [] -> "no node to distill" (E1 repro c)
 
 
 class _StubHandler(BaseHTTPRequestHandler):
@@ -156,13 +208,13 @@ class _StubHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/models/status":
             return 200, {"mock": self.server.mock}
         if path == "/api/v1/graph":
-            return 200, {"nodes": [{"id": NODE_ID}]}
+            return 200, {"nodes": self.server.graph_nodes}
         return 404, {"detail": "not found"}
 
     def _handle_post(self, path, body):
         if path == "/api/v1/distill":
             if body.get("dry_run"):
-                return 200, self.server.dry_run_body
+                return self.server.dry_run_status, self.server.dry_run_body
             if body.get("confirm"):
                 default = {"summary_note_id": "S — Alpha.md", "citations": 3,
                            "tokens_est": 64, "model": "claude-sonnet-5",
@@ -236,6 +288,22 @@ class StubBackend:
         self._server.dry_run_body = value
 
     @property
+    def dry_run_status(self):
+        return self._server.dry_run_status
+
+    @dry_run_status.setter
+    def dry_run_status(self, value):
+        self._server.dry_run_status = value
+
+    @property
+    def graph_nodes(self):
+        return self._server.graph_nodes
+
+    @graph_nodes.setter
+    def graph_nodes(self, value):
+        self._server.graph_nodes = value
+
+    @property
     def distill_status(self):
         return self._server.distill_status
 
@@ -271,7 +339,7 @@ def stub_backend():
 
 
 def _newest_transcript(reports_dir):
-    files = sorted(Path(reports_dir).glob("live_smoke_*.md"), key=lambda p: p.stat().st_mtime)
+    files = sorted(_transcript_files(reports_dir), key=lambda p: p.stat().st_mtime)
     assert files, f"no live_smoke transcript was written under {reports_dir}"
     return files[-1]
 
@@ -315,10 +383,12 @@ class TestMockBackendRefusal:
         body. The command must refuse before touching anything spend-capable."""
         stub_backend.mock = True
         envfile = _keys_env_file(tmp_path)
+        reports_dir = tmp_path / "reports"
         r = _run_smoke(tmp_path, extra_env={
             "SYNAPSE_ENV_FILE": str(envfile),
             "PORT": str(stub_backend.port),
             "SYNAPSE_SMOKE_YES": "1",  # even WITH consent pre-granted, mock must still refuse
+            "SYNAPSE_SMOKE_REPORTS_DIR": str(reports_dir),
         })
         combined = r.stdout + r.stderr
         assert r.returncode == 1, (
@@ -327,6 +397,9 @@ class TestMockBackendRefusal:
         assert "SYNAPSE_MOCK_MODELS" in combined, combined
         posts = [req for req in stub_backend.requests if req[0] == "POST"]
         assert posts == [], f"expected ZERO POSTs against a mocked backend; backend saw: {posts}"
+        assert _transcript_files(reports_dir) == [], (
+            "a mocked-backend refusal must leave no orphan transcript"
+        )
 
 
 # ── F2 — confirmation-before-spend ordering ─────────────────────────────────────
@@ -346,12 +419,14 @@ class TestConfirmationBeforeSpend:
         scratch-mutated copy of start.sh (this file only asserts against the real, unmutated
         command)."""
         envfile = _keys_env_file(tmp_path)
+        reports_dir = tmp_path / "reports"
         r = _run_smoke(tmp_path, extra_env={
             "SYNAPSE_ENV_FILE": str(envfile),
             "PORT": str(stub_backend.port),
-            # D1 now writes a transcript header + the free estimate BEFORE consent is decided,
-            # even on refusal — never let that land in the real, tracked project tree.
-            "SYNAPSE_SMOKE_REPORTS_DIR": str(tmp_path / "reports"),
+            # Isolate the reports dir even though this test asserts NO transcript is written —
+            # a regression that reintroduces early/eager creation must never land in the real,
+            # tracked project tree while this test is proving it shouldn't happen at all.
+            "SYNAPSE_SMOKE_REPORTS_DIR": str(reports_dir),
         })
         combined = r.stdout + r.stderr
         assert r.returncode == 1, (
@@ -361,6 +436,10 @@ class TestConfirmationBeforeSpend:
         paid = [req for req in stub_backend.requests if _is_paid_request(req)]
         assert paid == [], f"expected ZERO PAID POSTs before confirmation; backend saw: {paid}"
         assert "SYNAPSE_SMOKE_YES" in combined, combined
+        assert _transcript_files(reports_dir) == [], (
+            "E1 — nothing was spent and no provider execution began; a refused run must leave "
+            "no orphan transcript in the reports dir"
+        )
 
 
 # ── D1 — informed consent: the REAL estimate must be shown before/at the decision ──────────
@@ -378,30 +457,43 @@ class TestInformedConsent:
         requires_confirmation=true) and refuses consent (no SYNAPSE_SMOKE_YES): the real number
         must still be visible in the command's output — proving the dry-run happens BEFORE the
         consent decision, not conditionally on having already made it — and no PAID POST may
-        ever occur."""
+        ever occur. E2 hardening: asserts the exact BANNER line
+        (`Estimated cost: 119000 tokens`), not merely that the digits "119000" appear SOMEWHERE
+        in stdout — the loose form also matches the separate raw-JSON `estimate: {...}` log line
+        and would stay green even if the banner itself reverted to the static
+        SUMMARIZE_CONFIRM_THRESHOLD constant (start.sh's own comment names this exact edit as
+        "a contributor's most obvious next edit"). E1 hardening: a declined/refused run — nothing
+        spent, no provider execution begun — must leave NO orphan transcript file."""
         stub_backend.dry_run_body = {
             "tokens_est": 119000, "threshold": 20000, "requires_confirmation": True,
             "truncated": False, "sources": [NODE_ID],
         }
         envfile = _keys_env_file(tmp_path)
+        reports_dir = tmp_path / "reports"
         r = _run_smoke(tmp_path, extra_env={
             "SYNAPSE_ENV_FILE": str(envfile),
             "PORT": str(stub_backend.port),
             # SYNAPSE_SMOKE_YES intentionally NOT set — consent has not been given yet.
-            # D1 now writes a transcript header + the free estimate BEFORE consent is decided,
-            # even on refusal — never let that land in the real, tracked project tree.
-            "SYNAPSE_SMOKE_REPORTS_DIR": str(tmp_path / "reports"),
+            "SYNAPSE_SMOKE_REPORTS_DIR": str(reports_dir),
         })
         combined = r.stdout + r.stderr
         assert r.returncode == 1, (
             f"non-interactive without consent must still refuse; got {r.returncode}\n{combined}"
         )
-        assert "119000" in combined, (
-            f"the REAL per-node token estimate must be shown before/at the consent decision, "
-            f"not just the static SUMMARIZE_CONFIRM_THRESHOLD constant — it never appeared:\n{combined}"
+        assert "Estimated cost: 119000 tokens" in combined, (
+            f"the REAL per-node token estimate must be shown in the consent BANNER itself "
+            f"(not just logged separately as raw JSON), and never the static "
+            f"SUMMARIZE_CONFIRM_THRESHOLD constant — it never appeared:\n{combined}"
+        )
+        assert "cost-guard threshold: 20000" in combined, (
+            f"the threshold must be shown separately from the estimate, both real:\n{combined}"
         )
         paid = [req for req in stub_backend.requests if _is_paid_request(req)]
         assert paid == [], f"expected ZERO paid POSTs before informed consent; backend saw: {paid}"
+        assert _transcript_files(reports_dir) == [], (
+            "E1 — a declined/refused run (nothing spent, no provider execution begun) must "
+            "leave no orphan transcript in the reports dir"
+        )
 
     def test_confirmed_run_honours_the_estimate_and_still_spends_exactly_once(
             self, tmp_path, stub_backend):
@@ -423,7 +515,9 @@ class TestInformedConsent:
         })
         combined = r.stdout + r.stderr
         assert r.returncode == 0, f"expected a clean run; got returncode={r.returncode}\n{combined}"
-        assert "119000" in combined, f"the real estimate must still be shown:\n{combined}"
+        assert "Estimated cost: 119000 tokens" in combined, (
+            f"the real estimate must still be shown in the consent banner itself:\n{combined}"
+        )
         paid_distill = [
             req for req in stub_backend.requests
             if req[0] == "POST" and req[1] == "/api/v1/distill" and json.loads(req[2]).get("confirm")
@@ -432,6 +526,67 @@ class TestInformedConsent:
                          if req[0] == "POST" and req[1] == "/api/v1/render"]
         assert len(paid_distill) == 1, f"expected exactly one paid distill; got {paid_distill}"
         assert len(render_calls) == 1, f"expected exactly one render; got {render_calls}"
+
+
+# ── E1 — no orphan transcript when nothing was spent ────────────────────────────
+
+class TestNoOrphanTranscript:
+    def test_empty_node_list_leaves_no_transcript_file(self, tmp_path, stub_backend):
+        """Delta-adversary E1 repro (c) — the most likely first-run state (nothing ingested
+        yet): the backend answers with zero graph nodes, so `cmd_smoke` refuses ("no node to
+        distill") before ever making the free dry-run call, let alone any paid one. Nothing was
+        spent and no provider execution began — a header-only orphan file must not be created."""
+        stub_backend.graph_nodes = []
+        envfile = _keys_env_file(tmp_path)
+        reports_dir = tmp_path / "reports"
+        r = _run_smoke(tmp_path, extra_env={
+            "SYNAPSE_ENV_FILE": str(envfile),
+            "PORT": str(stub_backend.port),
+            "SYNAPSE_SMOKE_YES": "1",  # even with consent pre-granted — there is nothing to ask about
+            "SYNAPSE_SMOKE_REPORTS_DIR": str(reports_dir),
+        })
+        combined = r.stdout + r.stderr
+        assert r.returncode == 1, (
+            f"an empty node list must refuse (exit 1); got returncode={r.returncode}\n{combined}"
+        )
+        assert "no node to distill" in combined, combined
+        posts = [req for req in stub_backend.requests if req[0] == "POST"]
+        assert posts == [], f"expected ZERO POSTs when there is no node to distill; got {posts}"
+        assert _transcript_files(reports_dir) == [], (
+            "an empty-node-list refusal must leave no orphan transcript in the reports dir"
+        )
+
+    def test_dry_run_estimate_failure_still_retains_a_transcript(self, tmp_path, stub_backend):
+        """The counterpart to the two 'no orphan' tests above: a REAL failure — the free dry-run
+        call itself erroring — is diagnostic evidence worth keeping (F4's doctrine: a failed
+        HTTP call in the sequence gets a FAILED transcript section, not silence), unlike a clean
+        refusal where nothing went wrong and nothing was attempted. This pins that E1's fix
+        (deferred transcript creation) still creates the file when there's something real to
+        record, so 'no orphan on refusal' was not implemented by simply never writing a
+        transcript at all pre-consent."""
+        stub_backend.dry_run_status = 503
+        stub_backend.dry_run_body = {"detail": "graph index temporarily unavailable"}
+        envfile = _keys_env_file(tmp_path)
+        reports_dir = tmp_path / "reports"
+        r = _run_smoke(tmp_path, extra_env={
+            "SYNAPSE_ENV_FILE": str(envfile),
+            "PORT": str(stub_backend.port),
+            "SYNAPSE_SMOKE_YES": "1",
+            "SYNAPSE_SMOKE_REPORTS_DIR": str(reports_dir),
+        })
+        combined = r.stdout + r.stderr
+        assert r.returncode == 3, (
+            f"a dry-run HTTP failure must exit the documented failure code (3); "
+            f"got returncode={r.returncode}\n{combined}"
+        )
+        assert "No paid calls were made" in combined, combined
+        paid = [req for req in stub_backend.requests if _is_paid_request(req)]
+        assert paid == [], f"a dry-run failure must never be followed by a paid call; got {paid}"
+        transcript = _newest_transcript(reports_dir)
+        text = transcript.read_text(encoding="utf-8")
+        assert "FAILED" in text and "503" in text, (
+            f"the dry-run failure must be recorded, not silently dropped:\n{text}"
+        )
 
 
 # ── F1 — one non-spending estimate, exactly one paid distill, never two ─────────
