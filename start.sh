@@ -14,12 +14,17 @@
 #   ./start.sh service install|start|stop|restart|status|logs|uninstall
 #                           # run as an APP: supervised, restarts on crash, survives a closed terminal
 #   ./start.sh smoke        # Opt-in LIVE smoke (issue #3): real Anthropic distill + real
-#                           # gpt-image-1 render. Needs both keys, never runs in CI, shows a
-#                           # non-spending estimate and asks before spending.
+#                           # gpt-image-1 render. Needs both keys, never runs in CI. Fetches the
+#                           # REAL, non-spending token estimate for the actual node FIRST and
+#                           # shows it, then asks before spending — never a stale constant.
 #                           # SYNAPSE_SMOKE_YES=1 bypasses the interactive [y/N] confirm for
-#                           # non-interactive/agent runs that already reviewed the cost.
-#                           # Exit codes: 1 = actionable refusal, 2 = unknown command,
-#                           # 3 = a live provider call failed (see the transcript).
+#                           # non-interactive/agent runs that already reviewed the printed cost.
+#                           # SYNAPSE_SMOKE_REPORTS_DIR overrides where the transcript lands
+#                           # (default: the active sprint's reports/ dir).
+#                           # Exit codes: 1 = actionable refusal (nothing spent), 2 = unknown
+#                           # command, 3 = an HTTP call in the sequence failed or returned
+#                           # something unexpected — money may already have moved; see the
+#                           # transcript's FAILED section.
 #   ./start.sh help         # This help + URLs and links
 set -euo pipefail
 
@@ -292,7 +297,8 @@ cmd_help() {
   echo "     ./start.sh production   production server (Docker/CI — no reload)"
   echo "     ./start.sh test         run the test suite"
   echo "     ./start.sh smoke        live-model smoke (real \$: Anthropic distill + gpt-image render) — opt-in, needs keys, never in CI"
-  echo "                              ${C_DIM}(SYNAPSE_SMOKE_YES=1 skips the interactive [y/N] confirm)${C_OFF}"
+  echo "                              ${C_DIM}(SYNAPSE_SMOKE_YES=1 skips the interactive [y/N] confirm;${C_OFF}"
+  echo "                              ${C_DIM} SYNAPSE_SMOKE_REPORTS_DIR overrides the transcript location)${C_OFF}"
   echo "     ./start.sh status       ports + health   ·   ./start.sh stop"
   echo "     ./start.sh preflight    check prerequisites only (Python, Node) — offers installs"
   echo ""
@@ -380,17 +386,24 @@ cmd_test() {
 #   - refuses without both keys, actionably, exit 1 (never the unknown-command exit 2)
 #   - refuses against a SYNAPSE_MOCK_MODELS=1 backend (a zero-spend run must never be labeled
 #     a live smoke)
-#   - shows a genuinely non-spending token estimate (POST /distill {dry_run: true} — never
-#     calls the summarizer) and asks before making the ONE paid distill call (never two —
-#     `confirm: false` alone is NOT free: below the server's cost-guard threshold it still
-#     summarizes for real; SYNAPSE_SMOKE_YES=1 bypasses the interactive [y/N] for
-#     non-interactive/agent runs)
+#   - selects the node and fetches a genuinely non-spending token estimate (POST /distill
+#     {dry_run: true} — never calls the summarizer) BEFORE consent, and PRINTS the real
+#     tokens_est/threshold/requires_confirmation for THIS node — never a stale constant (a
+#     contributor's most obvious next edit, "just show the config threshold", was exactly the
+#     bug this closes: it let the operator consent blind to a node the script hadn't even
+#     chosen yet). Only the free dry-run POST may happen before consent; the ONE paid distill
+#     call (never two — `confirm: false` alone is NOT free: below the server's cost-guard
+#     threshold it still summarizes for real) and the render call both wait for it.
+#     SYNAPSE_SMOKE_YES=1 bypasses the interactive [y/N] for non-interactive/agent runs — it
+#     counts as informed consent only because the real estimate is always printed first.
 #   - talks to an ALREADY-RUNNING backend (./start.sh dev / service) — it does not manage its
 #     own stack, so it never touches the app lifecycle
-#   - records a transcript under the active sprint's reports/ dir (mktemp — collision-proof);
-#     a failed provider call gets a diagnostic, a FAILED section in the transcript with the
-#     safe response context, and a documented exit code (3) — never a bare curl exit status,
-#     and never a second provider call after an earlier failure
+#   - records a transcript under the active sprint's reports/ dir (mktemp — collision-proof;
+#     SYNAPSE_SMOKE_REPORTS_DIR overrides it). A failed or contract-violating HTTP call (bad
+#     status, or 2xx missing an expected field) gets a diagnostic, a FAILED section in the
+#     transcript with the safe response context, and the documented exit code 3 — never a bare
+#     curl exit status, never the plain-refusal code 1 once money may have moved, and never a
+#     later call in the sequence after an earlier failure
 smoke_is_ci() {
   case "${CI:-}" in true | TRUE | True | 1) return 0 ;; esac
   [ -n "${GITHUB_ACTIONS:-}" ] && return 0
@@ -435,6 +448,15 @@ smoke_load_env_once() {
   local f; f="$(smoke_env_file)"
   [ -f "$f" ] || return 0
   local raw line key value current
+  # ASCII-explicit identifier guards, under a locale-independent LC_ALL=C for this loop
+  # (delta-adversary D3): `[:alnum:]` is LOCALE-DEFINED — under a real UTF-8 locale a non-ASCII
+  # byte like "Ä" IS alnum, so the old guard let it through and `${!key}` aborted the whole
+  # command. Explicit `A-Za-z0-9` ranges plus `LC_ALL=C` make the match byte-value-based, so
+  # the same input is skipped safely under every locale, not just the C/POSIX default the
+  # shipped test's from-scratch env happened to run under.
+  local _smoke_had_lc_all=false _smoke_saved_lc_all=""
+  if [ -n "${LC_ALL+set}" ]; then _smoke_had_lc_all=true; _smoke_saved_lc_all="$LC_ALL"; fi
+  LC_ALL=C
   while IFS= read -r raw || [ -n "$raw" ]; do
     line="$(_smoke_trim "$raw")"
     case "$line" in ""|"#"*) continue ;; esac
@@ -445,15 +467,16 @@ smoke_load_env_once() {
     value="${value%\'}"; value="${value#\'}"
     [ -z "$key" ] && continue
     # config.py accepts ANY non-empty string as an os.environ key (it's just a dict); bash
-    # cannot export/expand a non-identifier name (`MY-VAR=1`) — skip it safely rather than
-    # let `${!key}` abort the whole command under `set -e` (F3).
+    # cannot export/expand a non-identifier name (`MY-VAR=1`, or any non-ASCII key) — skip it
+    # safely rather than let `${!key}` abort the whole command under `set -e` (F3/D3).
     case "$key" in [A-Za-z_]*) : ;; *) continue ;; esac
-    case "$key" in *[![:alnum:]_]*) continue ;; esac
+    case "$key" in *[!A-Za-z0-9_]*) continue ;; esac
     current="${!key:-}"
     if [ -z "$current" ] || smoke_is_placeholder "$current"; then
       export "$key=$value"
     fi
   done <"$f"
+  if $_smoke_had_lc_all; then LC_ALL="$_smoke_saved_lc_all"; else unset LC_ALL; fi
 }
 
 smoke_key_present() {
@@ -559,30 +582,10 @@ cmd_smoke() {
     fi
   fi
 
-  # 4) Spend estimate + explicit confirmation, BEFORE any paid call. SYNAPSE_SMOKE_YES=1 is the
-  # documented non-interactive bypass (agent/CI-adjacent automation that has already reviewed
-  # the cost) — it is the ONLY way past this gate without a real TTY [y/N] answer.
-  echo ""
-  log "About to make REAL, PAID provider calls:"
-  echo "     Anthropic distill  ${C_DIM}model ${SUMMARIZER_MODEL:-claude-sonnet-5}; server-side cost guard at${C_OFF} ${SUMMARIZE_CONFIRM_THRESHOLD:-20000} ${C_DIM}est. tokens (SUMMARIZE_CONFIRM_THRESHOLD)${C_OFF}"
-  echo "     OpenAI render      ${C_DIM}model ${IMAGE_MODEL:-gpt-image-1}; one image${C_OFF}"
-  echo "     ${C_DIM}A non-spending token estimate for the actual node runs first — see step 1/2 below.${C_OFF}"
-  echo ""
-  if [ "${SYNAPSE_SMOKE_YES:-}" != "1" ]; then
-    if [ -t 0 ]; then
-      printf "[start.sh] Proceed and spend real money? [y/N] "
-      local answer; read -r answer
-      case "$answer" in [yY]*) ;; *) log "Aborted — no calls made."; exit 1 ;; esac
-    else
-      log "✖ Non-interactive session — set SYNAPSE_SMOKE_YES=1 to confirm the spend and proceed."
-      exit 1
-    fi
-  fi
-
-  # 5) Run the two live smokes against the running backend; transcript every request/response.
-  # mktemp both creates the file AND guarantees a unique name (L3) — two runs in the same
-  # second (the old `date`-only name + `>`) used to silently overwrite one transcript with the
-  # other; this can never collide.
+  # 4) Set up the transcript early (issue #3 fix-loop D1) — a dry-run failure below must still
+  # be recorded, not just a paid-call failure. mktemp both creates the file AND guarantees a
+  # unique name (L3) — two runs in the same second (the old `date`-only name + `>`) used to
+  # silently overwrite one transcript with the other; this can never collide.
   local reports_dir; reports_dir="$(smoke_reports_dir)"
   mkdir -p "$reports_dir"
   local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -597,6 +600,8 @@ cmd_smoke() {
     echo ""
   } >"$transcript"
 
+  # 5) Select the node — BEFORE consent (D1): the operator must see the estimate for the node
+  # that will actually be distilled, not a generic promise.
   local node_id="${SYNAPSE_SMOKE_NODE_ID:-}"
   if [ -z "$node_id" ]; then
     node_id="$(curl -sf "http://localhost:$PORT/api/v1/graph" 2>/dev/null \
@@ -607,11 +612,12 @@ cmd_smoke() {
     exit 1
   fi
 
-  # 1/2 — a REAL, NON-SPENDING estimate (dry_run: true — issue #3 fix-loop F1). The OLD
+  # 6) A REAL, NON-SPENDING estimate (dry_run: true — F1), fetched BEFORE consent (D1). The OLD
   # `confirm: false` call LOOKED free but was not: below the cost-guard threshold the server
   # runs the real summarizer regardless, so every run spent twice and the transcript mislabeled
-  # a completed, paid summarization as "before spending". dry_run never reaches the summarizer.
-  log "1/2 Distill — node '$node_id'... (non-spending estimate)"
+  # a completed, paid summarization as "before spending". dry_run never reaches the summarizer,
+  # so this is the ONLY network call this command ever makes before the operator has consented.
+  log "Estimating cost for node '$node_id'... (non-spending)"
   if ! smoke_post_json "http://localhost:$PORT/api/v1/distill" \
       "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"dry_run\": true}"; then
     smoke_transcript_failure "$transcript" "Distill — cost estimate" "$SMOKE_LAST_STATUS" "$SMOKE_LAST_BODY"
@@ -627,7 +633,51 @@ cmd_smoke() {
   } >>"$transcript"
   log "  estimate: $estimate"
 
-  # The ONE paid distill call — never a second one (F1: no double-spend).
+  # Parse the REAL numbers out of the estimate for the consent banner below — never re-derive
+  # or guess them, and never fall back to the static SUMMARIZE_CONFIRM_THRESHOLD constant.
+  local est_fields tokens_est_val threshold_val truncated_val requires_confirmation_val
+  est_fields="$(echo "$estimate" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+print(d.get('tokens_est', '?'))
+print(d.get('threshold', '?'))
+print('yes' if d.get('truncated') else 'no')
+print('yes' if d.get('requires_confirmation') else 'no')
+" 2>/dev/null)" || est_fields=$'?\n?\nno\nno'
+  { IFS= read -r tokens_est_val; IFS= read -r threshold_val; IFS= read -r truncated_val; \
+    IFS= read -r requires_confirmation_val; } <<<"$est_fields"
+
+  # 7) Informed consent, BEFORE any paid call (D1) — honours requires_confirmation by SHOWING
+  # it rather than silently overriding it: the operator (or the documented SYNAPSE_SMOKE_YES
+  # bypass) decides with the real number in hand, not a config constant. SYNAPSE_SMOKE_YES=1
+  # only counts as consent BECAUSE the estimate above is always printed first, interactive or
+  # not — it is the ONLY way past this gate without a real TTY [y/N] answer.
+  echo ""
+  log "About to make REAL, PAID provider calls for node '$node_id':"
+  echo "     Anthropic distill  ${C_DIM}model ${SUMMARIZER_MODEL:-claude-sonnet-5}${C_OFF}"
+  echo "     ${C_B}Estimated cost:${C_OFF} ${tokens_est_val} tokens ${C_DIM}(cost-guard threshold: ${threshold_val})${C_OFF}"
+  if [ "$requires_confirmation_val" = "yes" ]; then
+    echo "     ${C_B}⚠ OVER the server's cost-guard threshold${C_OFF} — the server would normally require a second confirmation; this command is that confirmation."
+  fi
+  [ "$truncated_val" = "yes" ] && echo "     ${C_DIM}Note: the source set is truncated by the size cap — this estimate covers only what will actually be sent.${C_OFF}"
+  echo "     OpenAI render      ${C_DIM}model ${IMAGE_MODEL:-gpt-image-1}; one image${C_OFF}"
+  echo ""
+  if [ "${SYNAPSE_SMOKE_YES:-}" != "1" ]; then
+    if [ -t 0 ]; then
+      printf "[start.sh] Proceed and spend real money? [y/N] "
+      local answer; read -r answer
+      case "$answer" in [yY]*) ;; *) log "Aborted — no calls made."; exit 1 ;; esac
+    else
+      log "✖ Non-interactive session — set SYNAPSE_SMOKE_YES=1 to confirm the spend and proceed."
+      exit 1
+    fi
+  fi
+
+  # 8) The ONE paid distill call — never a second one (F1: no double-spend).
+  log "1/2 Distill — node '$node_id'... (paid)"
   if ! smoke_post_json "http://localhost:$PORT/api/v1/distill" \
       "{\"node_id\": \"$node_id\", \"scope\": \"node\", \"confirm\": true}"; then
     smoke_transcript_failure "$transcript" "Distill — result" "$SMOKE_LAST_STATUS" "$SMOKE_LAST_BODY"
@@ -646,8 +696,13 @@ cmd_smoke() {
   local summary_id; summary_id="$(echo "$distill_result" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('summary_note_id',''))" 2>/dev/null || true)"
   if [ -z "$summary_id" ]; then
-    log "✖ Distill did not return a summary note — see $transcript for the raw response. Render skipped."
-    exit 1
+    # D4 — the paid call already spent (2xx); a missing summary_note_id is a backend contract
+    # violation, not a refusal. This must NOT be the plain-refusal exit 1 (which the docs and
+    # this file's own usage block reserve for "nothing spent") — it is exit 3, with a FAILED
+    # transcript section, exactly like any other HTTP-layer failure in this sequence.
+    smoke_transcript_failure "$transcript" "Distill — missing summary_note_id" "$SMOKE_LAST_STATUS" "$distill_result"
+    log "✖ Distill returned HTTP $SMOKE_LAST_STATUS but no summary_note_id — see $transcript. No render call was made."
+    exit 3
   fi
 
   log "2/2 Render — summary '$summary_id'..."

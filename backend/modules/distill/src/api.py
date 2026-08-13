@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from app.core.config import load_settings
 
-from .providers import AnthropicSummarizer, MockSummarizer
+from .providers import AnthropicSummarizer, MockSummarizer, Summarizer
 from .service import ConfirmationRequired, DistillService, GroundingError
 
 router = APIRouter(prefix="/api/v1", tags=["distill"])
@@ -18,17 +18,21 @@ class DistillRequest(BaseModel):
     scope: str = "node"          # node | subtree
     depth: int = Field(2, ge=0, le=10)   # bounded — an unbounded int would pin the worker
     confirm: bool = False
-    dry_run: bool = False        # true → DistillService.estimate(): zero provider calls,
-                                  # the real token estimate for this exact node/scope/depth
+    dry_run: bool = False       # true → DistillService.estimate(): zero provider calls,
+                                 # the real token estimate for this exact node/scope/depth
 
 
-def _service() -> DistillService:
+def _service(require_summarizer: bool = True) -> DistillService:
+    """`require_summarizer=False` (issue #3 fix-loop D5) is for the dry-run/estimate path
+    ONLY — a free, non-spending call has no business 400-gating on a provider key it will
+    never use. The paid path (the default) still requires one, exactly as before."""
     s = load_settings()
+    summarizer: Summarizer | None = None
     if s.mock_models:
         summarizer = MockSummarizer()
     elif s.anthropic_key:
         summarizer = AnthropicSummarizer(s.anthropic_key, s.summarizer_model, s.summarizer_max_tokens)
-    else:
+    elif require_summarizer:
         raise HTTPException(status_code=400, detail=(
             "No ANTHROPIC_API_KEY configured (backend/.env) — set your key, or set "
             "SYNAPSE_MOCK_MODELS=1 to try the flow with the mock summarizer."))
@@ -37,14 +41,16 @@ def _service() -> DistillService:
 
 @router.post("/distill")
 def distill(req: DistillRequest) -> dict:
-    svc = _service()
     if req.dry_run:
         # Non-spending path: collects the source set and reports the true token estimate.
-        # Never reaches svc.summarizer — no ConfirmationRequired/GroundingError possible here.
+        # Never reaches svc.summarizer — no ConfirmationRequired/GroundingError possible here,
+        # and (D5) no provider key is required to reach it either.
+        svc = _service(require_summarizer=False)
         try:
             return svc.estimate(req.node_id, req.scope, req.depth)
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e.args[0]))
+    svc = _service()
     try:
         return svc.distill(req.node_id, req.scope, req.depth, req.confirm)
     except ConfirmationRequired as c:

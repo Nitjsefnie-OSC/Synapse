@@ -66,7 +66,10 @@ class GroundingError(Exception):
 
 
 class DistillService:
-    def __init__(self, vault_path: Path, summarizer: Summarizer, confirm_threshold: int = 20000):
+    def __init__(self, vault_path: Path, summarizer: Summarizer | None, confirm_threshold: int = 20000):
+        # `summarizer=None` is a valid, typed, narrow state — ONLY for `estimate()` (issue #3
+        # fix-loop D5): that path never calls it. `distill()` guards against the misuse below
+        # instead of failing with an opaque `NoneType has no attribute 'summarize'`.
         self.vault_path = Path(vault_path)
         self.graph = GraphService(vault_path)
         self.summarizer = summarizer
@@ -147,6 +150,11 @@ class DistillService:
         est = self.tokens_est(notes)
         if est > self.confirm_threshold and not confirm:
             raise ConfirmationRequired(est, self.confirm_threshold)
+        if self.summarizer is None:
+            raise RuntimeError(
+                "DistillService.distill() requires a summarizer — this instance was "
+                "constructed for estimate()-only (dry-run) use."
+            )
 
         subject = notes[0].title if notes else node_id
         result = self.summarizer.summarize(subject, notes, scope)

@@ -145,6 +145,29 @@ def test_distill_dry_run_makes_zero_summarizer_calls_and_returns_the_true_estima
     assert body.get("truncated") == truncated
 
 
+def test_distill_dry_run_does_not_require_a_provider_key_but_the_paid_path_still_does(client, monkeypatch):
+    """Delta-adversary D5 — a free, provider-less estimate that 400-gates on ANTHROPIC_API_KEY
+    is an incoherent API contract: `distill()`'s dry_run branch is reached only AFTER
+    `_service()` has already raised for a missing key, so `dry_run: true` was never actually
+    reachable without one. The paid path must still require the key exactly as before."""
+    monkeypatch.delenv("SYNAPSE_MOCK_MODELS", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-REPLACE-ME")  # placeholder = "no real key"
+    client.post("/api/v1/ingest")
+    client.post("/api/v1/rebuild")
+
+    r = client.post("/api/v1/distill", json={"node_id": "repo_a__docs__alpha.md", "dry_run": True})
+    assert r.status_code == 200, (
+        f"dry_run must work without a provider key — it never calls one; got {r.status_code}: {r.text}"
+    )
+    assert "tokens_est" in r.json()
+    assert r.json().get("summary_note_id") is None
+
+    r2 = client.post("/api/v1/distill", json={"node_id": "repo_a__docs__alpha.md"})
+    assert r2.status_code == 400 and "ANTHROPIC_API_KEY" in r2.json()["detail"], (
+        f"the paid path must still require a real key; got {r2.status_code}: {r2.text}"
+    )
+
+
 def test_roots_crud_with_prune(client, tmp_path, monkeypatch):
     # starts from the env-seeded list (source: env)
     roots = client.get("/api/v1/roots").json()
