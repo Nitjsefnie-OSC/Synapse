@@ -19,7 +19,7 @@ await page.waitForFunction(() => document.getElementById('wiki-crumb').textConte
 const noteCrumb = await page.locator('#wiki-crumb').textContent();
 const h1Rendered = await page.locator('#wiki-article h1').count();      // real <h1>, not raw '#'
 const infobox = await page.locator('.wiki-infobox').count();
-await page.screenshot({ path: '/home/avido/Synaptix-Labs/projects/synapse/tests/screenshots/wiki-popup-article.png' });
+await page.screenshot({ path: 'tests/screenshots/wiki-popup-article.png' });
 await page.click('#wiki-back');
 await page.waitForFunction(() => document.getElementById('wiki-crumb').textContent.includes('Index'));
 
@@ -39,7 +39,7 @@ await page.waitForTimeout(2500);   // let the force sim settle
 const box = await page.locator('#graph').boundingBox();
 await page.mouse.move(box.x + box.width * 0.3, box.y + box.height * 0.45);
 await page.waitForTimeout(300);
-await page.screenshot({ path: '/home/avido/Synaptix-Labs/projects/synapse/tests/screenshots/dashboard-obsidian-graph.png', fullPage: true });
+await page.screenshot({ path: 'tests/screenshots/dashboard-obsidian-graph.png', fullPage: true });
 
 console.log(JSON.stringify({ idxCrumb, wikilinksInIndex: wlCount, noteCrumb, h1Rendered, infobox, agentsH1 }));
 await browser.close();
