@@ -24,3 +24,9 @@ sprint02, sprint03, keys_panel) against a FIXTURE vault (repo_a + repo_b) with r
 `SYNAPSE_MOCK_MODELS=1` (the AI flow costs nothing). Opt-in via repo variable
 `ENABLE_E2E_CI=true` — kept off the always-on path because it needs a browser download +
 a live stack (~2–3 min). Screenshots are uploaded as the `explorer-e2e-evidence` artifact.
+
+After the mock-stack suites, the job restarts the backend keyless (mock seam off,
+`SYNAPSE_ENV_FILE` → the runner temp dir) on the same :8000 — the frontend's API base is
+fixed — and re-runs `keys_panel.spec.mjs` with `E2E_KEYS_WRITE_OK=1`. That proves the full
+unconfigured → ＋ Add keys → ready flow in CI with dummy keys that never leave the runner
+temp file; the step fails if the spec reports SKIP instead of the keyless PASS.

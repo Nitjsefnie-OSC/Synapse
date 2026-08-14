@@ -123,6 +123,34 @@ jobs:
           node tests/e2e/sprint05_assets.spec.mjs
           node tests/e2e/sprint05_ghosts.spec.mjs
           node tests/e2e/sprint05_lens.spec.mjs
+      # ── Keyless second leg (issue #4) ────────────────────────────────────────
+      # On the mock stack, keys_panel only exercises the badge branch — its write flow is
+      # double-gated (keyless stack AND E2E_KEYS_WRITE_OK=1). Restart the SAME port with the
+      # mock seam off and SYNAPSE_ENV_FILE pointed at the runner temp dir: the frontend's API
+      # base is fixed at :8000, so the two backend configs run sequentially, not in parallel.
+      - name: Restart the backend keyless (mock off, env file in the runner temp dir)
+        run: |
+          pkill -f 'uvicorn app.main:app' || true
+          for i in $(seq 1 15); do curl -sf http://localhost:8000/health > /dev/null 2>&1 || break; sleep 1; done
+          if curl -sf http://localhost:8000/health > /dev/null 2>&1; then echo "::error::the mock backend would not stop"; exit 1; fi
+          unset SYNAPSE_MOCK_MODELS ANTHROPIC_API_KEY OPENAI_API_KEY
+          export SYNAPSE_ENV_FILE="$RUNNER_TEMP/synapse-e2e-keys/.env"
+          cd backend && nohup .venv/bin/python -m uvicorn app.main:app --port 8000 > /tmp/be-keyless.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/health > /dev/null && break; sleep 1; done
+          curl -sf http://localhost:8000/api/v1/models/status | grep -q '"mock":false' || { echo "::error::the backend did not come up keyless"; cat /tmp/be-keyless.log; exit 1; }
+      - name: Run the keyless key-save flow (dummy keys, zero paid calls)
+        env:
+          E2E_KEYS_WRITE_OK: "1"
+        run: |
+          out=$(node tests/e2e/keys_panel.spec.mjs 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          # a SKIP also exits 0 — refuse green unless the save-flow leg actually ran
+          echo "$out" | grep -q 'PASS (keyless stack)'
+      - name: Verify the dummy keys landed ONLY in the runner temp env file
+        run: |
+          grep -q '^ANTHROPIC_API_KEY=sk-ant-e2e-test-1234abcd$' "$RUNNER_TEMP/synapse-e2e-keys/.env"
+          grep -q '^OPENAI_API_KEY=sk-e2e-test-9999wxyz$' "$RUNNER_TEMP/synapse-e2e-keys/.env"
+          test ! -e backend/.env
       - name: Upload E2E evidence
         if: always()
         uses: actions/upload-artifact@v4
